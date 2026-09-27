@@ -363,7 +363,13 @@ typedef union RecompXmm {
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
-#define XBOX_STACK_BASE     0x00780000
+/* The stack area -- the main guest stack, and the worker slices carved from
+ * its low end. 0x00780000 sits above the last section of most XBEs; for an
+ * image that reaches past it xbox_MemoryLayoutInit moves the area above the
+ * image (xbox_memory_layout.c), so this is a variable. */
+#define XBOX_STACK_BASE_DEFAULT 0x00780000u
+extern uint32_t g_xbox_stack_base;
+#define XBOX_STACK_BASE     g_xbox_stack_base
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
@@ -403,7 +409,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * ================================================================ */
 
 /** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00F80000 */
+#define XBOX_HEAP_BASE      (XBOX_STACK_BASE_DEFAULT + XBOX_STACK_SIZE)  /* 0x00F80000 */
 
 /** Exclusive top of the dynamic heap: the end of RAM for this run. Runtime,
  *  not a macro, because RAM size is now configurable (retail 64 MB vs devkit

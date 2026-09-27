@@ -1195,6 +1195,7 @@ ptrdiff_t g_xbox_mem_offset = 0;
  * nothing breaks before the title is loaded. */
 uint32_t g_xbox_image_lo = 0;
 uint32_t g_xbox_image_hi = 0;
+uint32_t g_xbox_stack_base = XBOX_STACK_BASE_DEFAULT;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
@@ -1859,6 +1860,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Set the global offset for recompiled code MEM macros */
     g_xbox_mem_offset = g_memory_offset;
+
+    /*
+     * Place the stack area. The default, 0x00780000, sits above the last
+     * section of most XBEs; a large image reaches past it and then every
+     * guest stack frame lands on the title's own data. Blinx's .data runs to
+     * 0x00ABFABC: the main stack's top (0x00F7FFF0) was inside MDLB10, and the
+     * kernel timer thread's worker slice (0x00780000-0x007C0000, where every
+     * vblank ISR and DPC runs) was inside a .bss pool the title publishes at
+     * [0x008EC3EC]. Physical [image_hi, 64 MB) is the contiguous arena, so the
+     * area goes at the bottom of the heap region instead, and the heap starts
+     * above it (xbox_HeapAlloc). Needs the heap region to exist: the 128 MB map
+     * the large-image auto-size picks. Otherwise it stays, with a warning.
+     */
+    if (g_xbox_image_hi > XBOX_STACK_BASE_DEFAULT) {
+        if ((uint64_t)g_memory_size >= (uint64_t)XBOX_CONTIG_SIZE + XBOX_STACK_SIZE + (16u << 20)) {
+            g_xbox_stack_base = XBOX_CONTIG_SIZE;
+            fprintf(stderr, "  [STACK] image_hi=0x%08X covers the default stack area;"
+                            " stack area moved to 0x%08X\n",
+                    g_xbox_image_hi, g_xbox_stack_base);
+        } else {
+            fprintf(stderr, "  [STACK] WARNING: image_hi=0x%08X covers the stack area"
+                            " at 0x%08X and there is no room above the image\n",
+                    g_xbox_image_hi, g_xbox_stack_base);
+        }
+    }
 
     /*
      * Initialize the Xbox stack for recompiled code.
@@ -3092,6 +3118,10 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
          * [0, image_hi) image | [image_hi, 64 MB) contiguous | [64 MB, map) heap. */
         if (XBOX_HEAP_TOP > XBOX_CONTIG_SIZE + (16u << 20) && above < XBOX_CONTIG_SIZE)
             above = XBOX_CONTIG_SIZE;
+        /* ...and above the stack area when it was moved into the heap region. */
+        if (g_xbox_stack_base != XBOX_STACK_BASE_DEFAULT
+            && above < g_xbox_stack_base + XBOX_STACK_SIZE)
+            above = g_xbox_stack_base + XBOX_STACK_SIZE;
         if (g_heap_next < above) {
             fprintf(stderr, "  [HEAP] rebase base 0x%08X -> 0x%08X (above image_hi=0x%08X, top=0x%08X)\n",
                     g_heap_next, above, g_xbox_image_hi, (uint32_t)XBOX_HEAP_TOP);
