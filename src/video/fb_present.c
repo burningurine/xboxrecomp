@@ -232,12 +232,40 @@ void xbox_FramebufferWindowStart(void)
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *blinx_get_android_window(void);   /* jni_bridge.c */
 #include "../nv2a/nv2a_pgraph_gles.h"          /* GLES 3D overlay (object-space batches) */
+#include "../kernel/frame_stats.h"
+#include <time.h>
 
 #define FBLOG(...) __android_log_print(ANDROID_LOG_INFO, "blinx-fb", __VA_ARGS__)
 
 static volatile int      s_fb_running;
 static volatile uint32_t s_fb_va, s_fb_pitch;
 static uint32_t          s_fb_width = 640, s_fb_height = 480;
+
+/* Output aspect: 0 = original 4:3, pillarboxed on the 16:9 panel (default --
+ * the game renders 640x480 and stretching it distorts everything); 1 = stretch
+ * to fill. RECOMP_ASPECT=stretch at boot, or fb_present_set_aspect() from the
+ * Java options menu. */
+static volatile int s_aspect_stretch = -1;
+void fb_present_set_aspect(int stretch) { s_aspect_stretch = stretch ? 1 : 0; }
+
+static void fb_dest_rect(int sw, int sh, int *x, int *y, int *w, int *h)
+{
+    if (s_aspect_stretch < 0) {
+        const char *a = getenv("RECOMP_ASPECT");
+        s_aspect_stretch = (a && a[0] == 's') ? 1 : 0;
+    }
+    if (s_aspect_stretch || sw <= 0 || sh <= 0) { *x = 0; *y = 0; *w = sw; *h = sh; return; }
+    if (sw * 3 >= sh * 4) { *h = sh; *w = sh * 4 / 3; }   /* wider than 4:3: pillarbox */
+    else                  { *w = sw; *h = sw * 3 / 4; }   /* taller: letterbox */
+    *x = (sw - *w) / 2; *y = (sh - *h) / 2;
+}
+
+static double fb_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -316,6 +344,9 @@ static void *fb_thread(void *unused)
                     cur = NULL;                /* force a retry next tick */
                     usleep(50000); continue;
                 }
+                /* Present on the display's vsync (the loop used to add a fixed
+                 * 16 ms sleep on top of the swap wait, halving the rate). */
+                eglSwapInterval(dpy, 1);
                 eglQuerySurface(dpy, surf, EGL_WIDTH, &sw);
                 eglQuerySurface(dpy, surf, EGL_HEIGHT, &sh);
                 if (sw <= 0) sw = (EGLint)s_fb_width;
@@ -344,6 +375,9 @@ static void *fb_thread(void *unused)
         }
         if (surf == EGL_NO_SURFACE) { usleep(50000); continue; }   /* no Surface: idle-wait */
 
+        double t_compose = fb_now_ms();
+        int dx, dy, dw, dh;
+        fb_dest_rect(sw, sh, &dx, &dy, &dw, &dh);
         uint32_t va = s_fb_va, pitch = s_fb_pitch;
         if (va && pitch && rgba) {
             const uint8_t *base = (const uint8_t *)((uintptr_t)va + xbox_GetMemoryOffset());
@@ -430,6 +464,7 @@ static void *fb_thread(void *unused)
                          GL_RGBA, GL_UNSIGNED_BYTE, rgba);
             glViewport(0, 0, sw, sh);
             glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
+            glViewport(dx, dy, dw, dh);
             glUseProgram(prog); glBindVertexArray(vao);
             glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -443,7 +478,8 @@ static void *fb_thread(void *unused)
         /* Composite the GLES 3D layer (object-space batches the CPU raster
          * can't place) over the guest framebuffer we just blitted. No-op unless
          * RECOMP_GLES_3D is set. Runs here because this thread owns the context. */
-        nv2a_gles_render(sw, sh);
+        nv2a_gles_render(dx, dy, dw, dh);
+        fs_host_present(fb_now_ms() - t_compose);
 
         if (!eglSwapBuffers(dpy, surf)) {       /* Surface lost (e.g. torn down) → rebuild */
             FBLOG("eglSwapBuffers failed 0x%x; dropping surface", eglGetError());
@@ -451,7 +487,6 @@ static void *fb_thread(void *unused)
             eglDestroySurface(dpy, surf);
             surf = EGL_NO_SURFACE; cur = NULL;
         }
-        usleep(16000);
     }
 
     if (surf != EGL_NO_SURFACE) { eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

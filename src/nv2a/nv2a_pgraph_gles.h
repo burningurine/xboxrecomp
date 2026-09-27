@@ -49,7 +49,10 @@ void nv2a_gles_frame(void);
 /* Consumer (presenter GL thread, context current). Draw the last published
  * batch into an FBO with a depth buffer and composite it over the default
  * framebuffer. surf_w/surf_h are the window surface dimensions. */
-void nv2a_gles_render(int surf_w, int surf_h);
+/* Draw the latest published 3D frame and composite it into the destination
+ * rectangle (vx,vy,vw,vh) of the current default framebuffer -- the same
+ * rectangle the guest framebuffer was blitted to (aspect-correct letterbox). */
+void nv2a_gles_render(int vx, int vy, int vw, int vh);
 
 #ifdef __cplusplus
 }

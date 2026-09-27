@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(vblank_pacer_test C)
+set(CMAKE_C_STANDARD 11)
+add_executable(vblank_pacer_test test_main.c)
+target_include_directories(vblank_pacer_test PRIVATE ../../src/kernel)
+enable_testing()
+add_test(NAME vblank_pacer_test COMMAND vblank_pacer_test)

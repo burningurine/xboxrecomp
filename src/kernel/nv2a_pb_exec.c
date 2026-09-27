@@ -31,6 +31,7 @@
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
+#include "frame_stats.h"
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -2387,6 +2388,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             /* Three ways a batch can have arrived, and only one is in use at
              * a time: vertices completed by SET_VERTEX4F, a payload written
              * with INLINE_ARRAY, or indices into the title's own arrays. */
+            fs_draw(s_gpu.imm_count ? s_gpu.imm_count
+                    : s_gpu.inline_count ? s_gpu.inline_count : s_gpu.idx_count);
             if (s_gpu.imm_count)
                 draw_immediate();
             else if (s_gpu.inline_count)
@@ -2490,6 +2493,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        fs_guest_flip();
         /* Frame boundary: publish the object-space batch built this frame to
          * the presenter's GL thread. */
 #if defined(__ANDROID__)

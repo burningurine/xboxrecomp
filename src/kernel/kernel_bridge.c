@@ -28,6 +28,9 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "vblank_pacer.h"
+#include "frame_stats.h"
+#include <time.h>
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -2299,21 +2302,107 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* ---- vblank cadence -------------------------------------------------------
+ * The guest paces its game loop off the vblank callback's frame counter, so the
+ * host vblank rate IS the game clock. It used to be a GetTickCount64 "now + 16"
+ * gate polled from a Sleep(10) loop, which drifts one loop quantum per vblank:
+ * ~50 Hz measured on the RP6 (game ~17-20% slow), worse on Windows where Sleep
+ * rounds to the 15.6 ms scheduler tick. Now: absolute deadlines on a monotonic
+ * ns clock (vblank_pacer.h), and the timer thread sleeps precisely to the next
+ * deadline. RECOMP_VBLANK_HZ overrides the default NTSC 59.94 Hz (e.g. 50). */
+static vbl_pacer g_vbl_pacer;
+static int       g_vbl_enabled = -1;
+
+static int64_t kb_mono_ns(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    return (int64_t)((double)c.QuadPart * 1e9 / (double)freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+
+static void kb_sleep_ns(int64_t ns)
+{
+    if (ns <= 0) return;
+#ifdef _WIN32
+    {
+        /* Sleep() rounds up to the 15.6 ms scheduler tick; a high-resolution
+         * waitable timer (Win10 1803+) wakes within ~0.5 ms. */
+        static HANDLE t;
+        static int tried;
+        LARGE_INTEGER due;
+        if (!tried) {
+            tried = 1;
+            t = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+        }
+        if (!t) { Sleep((DWORD)((ns + 999999) / 1000000)); return; }
+        due.QuadPart = -(ns / 100);
+        if (due.QuadPart == 0) due.QuadPart = -1;
+        SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE);
+        WaitForSingleObject(t, INFINITE);
+    }
+#else
+    {
+        struct timespec ts;
+        ts.tv_sec = (time_t)(ns / 1000000000LL);
+        ts.tv_nsec = (long)(ns % 1000000000LL);
+        while (nanosleep(&ts, &ts) != 0) { /* EINTR: sleep the remainder */ }
+    }
+#endif
+}
+
+static int kernel_vblank_enabled(void)
+{
+    if (g_vbl_enabled < 0) {
+        const char *hz = getenv("RECOMP_VBLANK_HZ");
+        int64_t period = VBL_PERIOD_NTSC_NS;
+        if (hz && atof(hz) > 1.0)
+            period = (int64_t)(1e9 / atof(hz));
+        vbl_pacer_init(&g_vbl_pacer, period);
+        g_vbl_enabled = getenv("RECOMP_VBLANK") != NULL;
+        fprintf(stderr, "  [VBLANK] pacer %s, period %.3f ms (%.3f Hz)\n",
+                g_vbl_enabled ? "on" : "off", period / 1e6, 1e9 / (double)period);
+        fflush(stderr);
+    }
+    return g_vbl_enabled;
+}
+
+/* Delivered/dropped vblank totals, for the frame-stats overlay. */
+void kernel_vblank_get_stats(uint64_t *fired, uint64_t *dropped)
+{
+    if (fired)   *fired = g_vbl_pacer.fired;
+    if (dropped) *dropped = g_vbl_pacer.dropped;
+}
+
+static void kernel_vblank_fire(long long now);
+
 static void kernel_vblank_tick(void)
 {
-    static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    int64_t now_ns;
+    int n = 0;
 
-    if (enabled < 0)
-        enabled = getenv("RECOMP_VBLANK") != NULL;
-    if (!enabled)
+    if (!kernel_vblank_enabled())
         return;
+    now_ns = kb_mono_ns();
+    /* A late loop owes more than one vblank; deliver up to the backlog cap. */
+    while (n < VBL_MAX_BACKLOG && vbl_pacer_poll(&g_vbl_pacer, now_ns)) {
+        kernel_vblank_fire((long long)(now_ns / 1000000));
+        n++;
+        now_ns = kb_mono_ns();
+    }
+}
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+/* One vblank: raise the NV2A vblank interrupt and run the guest's callback. */
+static void kernel_vblank_fire(long long now)
+{
 
     /* New-game/save-record trace (RECOMP_SAVETRACE): dump the player-select
      * substate machine plus the selected slot's magic/mid/checksum vs the
@@ -3068,7 +3157,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long ts0, ts_vbl, ts_irq, ts_drain, ts_misc, ts_end;
         int i;
 
-        Sleep(10);
+        {
+            /* Sleep precisely to the next vblank deadline, but wake at least
+             * every 4 ms so DPCs and due timers keep their service latency. */
+            int64_t w = kernel_vblank_enabled()
+                      ? vbl_pacer_wait_ns(&g_vbl_pacer, kb_mono_ns()) : 10000000LL;
+            if (w > 4000000LL) w = 4000000LL;
+            kb_sleep_ns(w);
+        }
         ts0 = (long long)GetTickCount64();
         kernel_vblank_tick();  /* the GPU's frame clock */
         ts_vbl = (long long)GetTickCount64();
@@ -3080,6 +3176,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         stackscan_tick();      /* opt-in: one-shot guest-stack call-chain scan */
         pcsample_tick();       /* opt-in: one-shot thread-context PC sampler */
         gpu_idle_tick();       /* opt-in: reflect NV2A GPU-idle regs (test harness) */
+        fs_log_tick();         /* 1 Hz [STATS] line (frame_stats.c) */
         ts_misc = (long long)GetTickCount64();
         now = ts_misc;
 

@@ -58,6 +58,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../kernel/frame_stats.h"
 #include <stdio.h>
 #include <android/log.h>
 
@@ -368,6 +369,7 @@ static GLuint gltex_gl(uint32_t texid, int n)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, e->w, e->h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, e->rgba);
+        fs_tex_upload((uint32_t)(e->w * e->h * 4));
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, e->wrap_u);
@@ -378,7 +380,7 @@ static GLuint gltex_gl(uint32_t texid, int n)
     return 0;
 }
 
-void nv2a_gles_render(int surf_w, int surf_h)
+void nv2a_gles_render(int vx, int vy, int surf_w, int surf_h)
 {
     if (!nv2a_gles_enabled()) return;
 
@@ -451,7 +453,7 @@ void nv2a_gles_render(int surf_w, int surf_h)
 
     /* --- composite FBO colour over whatever is on the default framebuffer --- */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, surf_w > 0 ? surf_w : w, surf_h > 0 ? surf_h : h);
+    glViewport(vx, vy, w, h);
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -486,6 +488,6 @@ void nv2a_gles_tri_tex(const float a[4], const float b[4], const float c[4],
                        uint32_t argb, uint32_t texid)
 { (void)a; (void)b; (void)c; (void)u0; (void)u1; (void)u2; (void)argb; (void)texid; }
 void nv2a_gles_frame(void) {}
-void nv2a_gles_render(int w, int h) { (void)w; (void)h; }
+void nv2a_gles_render(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }
 
 #endif
