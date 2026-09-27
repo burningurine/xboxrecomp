@@ -777,7 +777,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
     if flag_setter in ("rol", "ror", "rcl", "rcr"):
-        # ZF/SF not modified by rotations - can't resolve most conditions
+        # rcl/rcr carry out through _cf (see _lift_rotate_carry); ZF/SF are
+        # not modified by rotations, so nothing else can be resolved.
+        if flag_setter in ("rcl", "rcr"):
+            if jcc in ("jb", "jnae", "jc"):
+                return "_cf", desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return "!_cf", desc
         return None
 
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
@@ -1219,6 +1225,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1857,6 +1865,31 @@ class Lifter:
         cnt = _fmt_operand_read(ops[1])
         func = "ROL32" if m == "rol" else "ROR32"
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+
+    def _lift_rotate_carry(self, insn, ops, m):
+        """RCL/RCR: rotate through carry -- a (w+1)-bit rotation of CF:dst.
+
+        The low halves of 64-bit shifts in the CRT's long divide/multiply
+        helpers (shr hi,1 / rcr lo,1) carry the bit between the halves this
+        way; dropping it made those helpers return wrong results. The count is
+        masked to 5 bits, then taken mod w+1 (only 8/16-bit forms wrap)."""
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        w = (_operand_width(ops[0]) or 4) * 8
+        mask = (1 << w) - 1
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        if m == "rcr":
+            rot = f"(_v >> _c) | (_v << ({w + 1} - _c))"
+        else:
+            rot = f"(_v << _c) | (_v >> ({w + 1} - _c))"
+        return ["{ unsigned _c = ((unsigned)(%s) & 0x1Fu) %% %du;"
+                " if (_c) { uint64_t _v = ((uint64_t)(_cf & 1) << %d)"
+                " | ((uint64_t)(%s) & 0x%Xu); _v = (%s) & 0x%XULL;"
+                " _cf = (int)((_v >> %d) & 1); %s } }  /* %s */"
+                % (cnt, w + 1, w, dst, mask, rot, (1 << (w + 1)) - 1, w,
+                   _fmt_operand_write(ops[0], "(uint32_t)(_v & 0x%Xu)" % mask),
+                   m)]
 
     # ── Compare / Test (standalone) ──
 
