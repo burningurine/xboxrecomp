@@ -2335,7 +2335,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    static int s_verbose = -1;
+    if (s_verbose < 0) s_verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (s_verbose) {
         static int shown[8];
         int slot = -1;
         switch (method) {

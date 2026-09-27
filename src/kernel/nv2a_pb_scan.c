@@ -144,15 +144,22 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+/* Walk [start_va, end_va), stopping early at a JUMP; *jump_off receives the
+ * jump's target (a pushbuffer offset, i.e. a physical address) or ~0u. */
+static void pb_scan_core(uint32_t start_va, uint32_t end_va, uint32_t *jump_off)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t va = start_va;
+    *jump_off = ~0u;
     uint32_t words = 0, jumps = 0, unknown = 0;
 
-    if (s_exec_enabled < 0)
+    static int s_scan = -1, s_trace = -1;   /* env is fixed at start-up */
+    if (s_exec_enabled < 0) {
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
+        s_scan  = getenv("RECOMP_PB_SCAN") != NULL;
+        s_trace = getenv("RECOMP_PB_METHOD_TRACE") != NULL;
+    }
+    if (!(s_scan || s_exec_enabled) || end_va <= start_va)
         return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
@@ -164,6 +171,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
             jumps++;
+            *jump_off = ((w & 3u) == 1u) ? (w & 0xFFFFFFFCu)   /* JUMP     */
+                                         : (w & 0x1FFFFFFCu);  /* OLD_JUMP */
             break;                            /* a jump ends this segment */
         }
         if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
@@ -230,7 +239,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                  * (0x1E94) and vertex-array offset (0x1720) + vertex0 position,
                  * so the batch using a given texture (e.g. the 128x256 startup
                  * art) can be found with its exact transform inputs. */
-                if (getenv("RECOMP_PB_METHOD_TRACE")) {
+                if (s_trace) {
                     static uint32_t _voff = 0, _tex = 0, _mode = 0, _vpstart = 0;
                     static uint32_t _vsx = 0, _vsy = 0, _vox = 0, _voy = 0;
                     static int _nd = 0;
@@ -272,4 +281,30 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+}
+
+void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+{
+    uint32_t jump_off;
+    pb_scan_core(start_va, end_va, &jump_off);
+}
+
+/* Consume everything from from_va up to put_va, following JUMPs. D3D's
+ * pushbuffer is a ring: at its end the title writes a JUMP back to the start
+ * and carries on, so PUT comes out below the last position. Scanning only
+ * [last, put) when put > last dropped every segment that crossed a wrap --
+ * the ring's tail and head -- and with them any state or vertex-program upload
+ * that happened to span it (xemu then asserts on the half-loaded program).
+ * phys_base maps a jump target (physical) back to a guest VA. */
+void nv2a_pb_drain(uint32_t from_va, uint32_t put_va, uint32_t phys_base)
+{
+    uint32_t va = from_va;
+    for (int hops = 0; hops < 8 && va != put_va; hops++) {
+        uint32_t jump_off;
+        uint32_t end = (va < put_va) ? put_va : va + 0x400000u;
+        pb_scan_core(va, end, &jump_off);
+        if (jump_off == ~0u)
+            break;                            /* reached PUT (or the bound) */
+        va = phys_base | (jump_off & 0x0FFFFFFFu);
+    }
 }

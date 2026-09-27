@@ -1517,6 +1517,26 @@ static DWORD ke_lazyback_ms(void)
  * Honors the dispatcher Type byte: 1 = Synchronization (auto-reset), else
  * Notification (manual-reset). Seeds the host state from the guest SignalState
  * mirror so a set that landed before the backing existed is not lost. */
+/* Guest KEVENTs that got their host event from lazy-backing. Only these are
+ * signalled exclusively through KeSetEvent (which mirrors SignalState), so
+ * only for these is a cleared guest SignalState a reliable "reset". */
+#define KE_MAX_LAZY 64
+static uint32_t g_ke_lazy[KE_MAX_LAZY];
+static volatile LONG g_ke_lazy_n;
+static void ke_lazy_note(uint32_t va)
+{
+    LONG i = InterlockedIncrement(&g_ke_lazy_n) - 1;
+    if (i < KE_MAX_LAZY) g_ke_lazy[i] = va;
+}
+static int ke_is_lazy(uint32_t va)
+{
+    LONG n = g_ke_lazy_n, i;
+    if (n > KE_MAX_LAZY) n = KE_MAX_LAZY;
+    for (i = 0; i < n; i++)
+        if (g_ke_lazy[i] == va) return 1;
+    return 0;
+}
+
 static HANDLE ke_lazyback_get(uint32_t guest_va)
 {
     HANDLE h;
@@ -1530,8 +1550,10 @@ static HANDLE ke_lazyback_get(uint32_t guest_va)
         uint32_t sig  = BRIDGE_MEM32(guest_va + 4);
         BOOL     manual = (type == 1) ? FALSE : TRUE;
         h = CreateEventW(NULL, manual, sig ? TRUE : FALSE, NULL);
-        if (h)
+        if (h) {
             ke_shadow_insert(guest_va, h);
+            ke_lazy_note(guest_va);
+        }
     }
     return h;
 }
@@ -1575,6 +1597,24 @@ static void bridge_KeSetEvent(void)
         g_eax = (uint32_t)SetEvent(h);
     else
         g_eax = 0;
+}
+
+/* A lazy-backed guest KEVENT can be reset without the kernel:
+ * D3D's BlockUntilVerticalBlank clears Header.SignalState inline and then
+ * waits. The host event never saw that, stayed signalled after the first
+ * vblank, and every wait returned at once -- the vblank thread ran flat out.
+ * Before a wait, a cleared guest SignalState is the truth; after a satisfied
+ * wait on a synchronization event, the event is consumed on the guest side
+ * too. Events only (type 0 notification, 1 synchronization). */
+static void ke_event_pre_wait(uint32_t object, HANDLE h)
+{
+    if (BRIDGE_MEM8(object) <= 1 && BRIDGE_MEM32(object + 4) == 0)
+        ResetEvent(h);
+}
+static void ke_event_post_wait(uint32_t object, uint32_t status)
+{
+    if (status == 0 && BRIDGE_MEM8(object) == 1)
+        BRIDGE_MEM32(object + 4) = 0;
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
@@ -1632,8 +1672,10 @@ static void bridge_KeWaitForSingleObject(void)
                 if (lb) {
                     /* Block until a real KeSetEvent wakes us, bounded so a wake
                      * that never arrives degrades to today's poll, not a hang. */
+                    ke_event_pre_wait(object, lb);
                     WaitForSingleObject(lb, ke_lazyback_ms());
                     g_eax = 0x00000000u;   /* STATUS_SUCCESS (woken or timed out) */
+                    ke_event_post_wait(object, g_eax);
                     return;
                 }
             }
@@ -1644,9 +1686,16 @@ static void bridge_KeWaitForSingleObject(void)
     }
     ke_diag_log('W', object, h);
 
-    g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        h, wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    {
+        int lazy = ke_is_lazy(object);
+        if (lazy)
+            ke_event_pre_wait(object, h);
+        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+            h, wait_reason, wait_mode,
+            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (lazy)
+            ke_event_post_wait(object, g_eax);
+    }
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2313,6 +2362,8 @@ static int kernel_raise_interrupt(uint32_t vector)
 static vbl_pacer g_vbl_pacer;
 static int       g_vbl_enabled = -1;
 
+static int64_t kb_mono_ns(void);
+int64_t kb_mono_ns_public(void) { return kb_mono_ns(); }
 static int64_t kb_mono_ns(void)
 {
 #ifdef _WIN32
@@ -2383,6 +2434,33 @@ void kernel_vblank_get_stats(uint64_t *fired, uint64_t *dropped)
 }
 
 static void kernel_vblank_fire(long long now);
+static void kernel_drain_dpcs(void);
+
+/* RECOMP_VBLANK_DPC: let the title's own vblank DPC see the vblank.
+ *
+ * The D3D ISR claims the interrupt and queues a DPC; the DPC re-reads
+ * PMC_INTR_0 and only runs its vblank handler (flip retire, VerticalBlankEvent
+ * set, vblank callback) while the PCRTC bit is still set. The NV2A ack thread
+ * holds the interrupt registers at zero (plain RAM has no write-1-to-clear), so
+ * by the time the DPC ran the bit was gone: the handler never ran, the event
+ * was never set, and D3D's BlockUntilVerticalBlank thread spun flat out.
+ * With this on, the timer thread keeps the bits (ack thread told to leave them
+ * for up to 2 ms), runs the DPC straight after the ISR, then retires them. */
+static int vblank_dpc_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_VBLANK_DPC") != NULL;
+    return on;
+}
+static volatile int64_t g_vblank_hold_until_ns;
+
+int64_t kb_mono_ns_public(void);
+/* Nonzero while the vblank bits belong to a vblank in service. */
+int xbox_VblankBitsHeld(void)
+{
+    int64_t until = g_vblank_hold_until_ns;
+    return until != 0 && kb_mono_ns_public() < until;
+}
 
 static void kernel_vblank_tick(void)
 {
@@ -2447,6 +2525,11 @@ static void kernel_vblank_fire(long long now)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
+    int vdpc = vblank_dpc_on();
+    uint32_t heartbeat0 = BRIDGE_MEM32(0x0051A0A0u);
+    int title_beat = 0;
+    if (vdpc)
+        g_vblank_hold_until_ns = kb_mono_ns() + 2000000;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
@@ -2455,6 +2538,15 @@ static void kernel_vblank_fire(long long now)
         static unsigned n_inv, n_claim, n_decl;
         static long long last_report;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        if (vdpc) {
+            kernel_drain_dpcs();          /* the DPC the ISR just queued */
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
+            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   &= ~NV2A_PMC_INTR_PCRTC;
+            g_vblank_hold_until_ns = 0;
+            /* The title's handler called its own vblank callback: don't
+             * beat the heartbeat a second time below. */
+            title_beat = BRIDGE_MEM32(0x0051A0A0u) != heartbeat0;
+        }
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
@@ -2483,7 +2575,7 @@ static void kernel_vblank_fire(long long now)
          * a claimed one: the kick clears the phantom present-pending below, which
          * makes the vector-3 ISR sub_0013D8B0 (claims only while [device+0x140]!=0)
          * go quiet -- so the heartbeat has to stand on its own or [0x51A0A0] stalls. */
-        if (claimed > 0 || flip_kick) {
+        if ((claimed > 0 || flip_kick) && !title_beat) {
             static int cb_off = -1;
             if (cb_off < 0) cb_off = getenv("RECOMP_NO_VBLANK_CB") != NULL;
             if (!cb_off) {

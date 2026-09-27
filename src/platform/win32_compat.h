@@ -91,6 +91,15 @@ LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Compara
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 
+/* Spin-wait hint (the winnt.h macro). */
+#if defined(__aarch64__) || defined(__arm__)
+#  define YieldProcessor() __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__x86_64__) || defined(__i386__)
+#  define YieldProcessor() __asm__ __volatile__("pause" ::: "memory")
+#else
+#  define YieldProcessor() ((void)0)
+#endif
+
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
 VOID InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin);

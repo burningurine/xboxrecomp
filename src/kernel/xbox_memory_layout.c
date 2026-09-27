@@ -918,6 +918,74 @@ static void gpu_idle_reflect_tick(void)
     }
 }
 
+/* Pushbuffer drain, shared by the ack thread and guest threads that wait for
+ * GPU idle (xbox_Nv2aDrainNow). The lock keeps segments in order and the
+ * executor single-threaded; a spin lock because each hold is short and the
+ * waiter is a busy guest thread anyway. */
+static volatile LONG s_drain_lock;
+static uint32_t s_drain_last_put;
+static DWORD    s_drain_last_ms;
+
+static void drain_lock(void)
+{
+    /* test-and-test-and-set: spin on a plain read, CAS only when it looks
+     * free, so a waiter doesn't bounce the line off the holder */
+    for (;;) {
+        while (s_drain_lock)
+            YieldProcessor();
+        if (InterlockedCompareExchange(&s_drain_lock, 1, 0) == 0)
+            return;
+    }
+}
+static int drain_trylock(void)
+{
+    return !s_drain_lock
+        && InterlockedCompareExchange(&s_drain_lock, 1, 0) == 0;
+}
+static void drain_unlock(void) { InterlockedExchange(&s_drain_lock, 0); }
+
+/* Walk whatever the title submitted since the last drain, then reflect GPU
+ * idle. Returns 1 if a segment was drained. */
+static int nv2a_drain_locked(volatile uint32_t *regs, DWORD now_ms)
+{
+    extern void nv2a_pb_drain(uint32_t, uint32_t, uint32_t);
+    uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+    int drained = 0;
+    if (put != s_drain_last_put || (now_ms - s_drain_last_ms) > 2000) {
+        /* DMA_PUT holds a PHYSICAL address (Xbox D3D writes VA & 0x0FFFFFFF);
+         * the contiguous window is the physical view, so OR its base back.
+         * put < last is a ring wrap; the drain follows the JUMP. */
+        if (s_drain_last_put && put != s_drain_last_put) {
+            nv2a_pb_drain(XBOX_CONTIG_BASE | (s_drain_last_put & 0x0FFFFFFFu),
+                          XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu),
+                          XBOX_CONTIG_BASE);
+            gpu_idle_reflect_tick();
+            drained = 1;
+        }
+        s_drain_last_put = put;
+        s_drain_last_ms = now_ms;
+    }
+    /* GET reports what has been CONSUMED. D3D reuses pushbuffer space behind
+     * GET, so moving it before the drain let the title overwrite commands the
+     * executor had not read yet; the executor then resumed mid-command in the
+     * new stream and fed the renderer garbage (xemu asserted on an unknown
+     * fog mode / VS input). */
+    *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) = s_drain_last_put;
+    return drained;
+}
+
+/* Called by guest threads before they spin on GPU-idle registers. */
+void xbox_Nv2aDrainNow(void)
+{
+    if (!g_nv2a_memory)
+        return;
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+    drain_lock();
+    nv2a_drain_locked(regs, GetTickCount());
+    gpu_idle_reflect_tick();
+    drain_unlock();
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -928,11 +996,31 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
      * guest stops submitting, so an idle guest still costs no core. */
     DWORD hot_until = 0;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
+        /* Drain before reflecting anything: every idle/fence/GET value below
+         * claims work is done, so it must describe work that IS done. A guest
+         * thread holding the lock is draining right now (possibly waiting on
+         * the host GPU); don't spin on it, and don't reflect half-done work --
+         * come back shortly. */
+        if (!drain_trylock()) {
+            Sleep(1);     /* the holder drains; yielding in a loop cost a core */
+            continue;
+        }
+        if (nv2a_drain_locked(regs, GetTickCount()))
+            hot_until = GetTickCount() + 50;   /* ~50 ms hot window */
+        drain_unlock();
+        {
+            extern int xbox_VblankBitsHeld(void);
+            int vbl_held = xbox_VblankBitsHeld();
+            for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+                volatile uint32_t *r =
+                    (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+                uint32_t mask = NV2A_ACK[i].busy_mask;
+                if (vbl_held) {    /* a vblank the title's DPC has yet to see */
+                    if (NV2A_ACK[i].offset == 0x000100) mask &= ~(1u << 24);
+                    if (NV2A_ACK[i].offset == 0x600100) mask &= ~1u;
+                }
+                if (*r & mask)
+                    *r &= ~mask;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -940,15 +1028,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
-            }
-        }
-        {
-            volatile uint32_t *put =
-                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            volatile uint32_t *get =
-                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            if (*get != *put) {
-                *get = *put;
             }
         }
         reg_acks_tick(regs);   /* clear any GPU-flush bits a title spins on */
@@ -975,50 +1054,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             /* Is the title submitting GPU work at all? PUT is where the
              * title's pushbuffer writer has got to; if it never moves, nothing
              * is being drawn and the missing piece is upstream of the GPU. */
-            static DWORD  last_put_ms;
             static uint32_t last_put;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            if (put != last_put || (now_ms - last_put_ms) > 2000) {
-                /* Survey the segment the title just submitted, once. */
-                {
-                    extern void nv2a_pb_scan(uint32_t, uint32_t);
-                    extern void nv2a_pb_scan_report(void);
-                    static DWORD last_report;
-
-                    /* DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
-                     * `VA & 0x0FFFFFFF` and reads the GPU's position back as
-                     * `GET | 0x80000000`. nv2a_pb_scan reads guest VAs, so
-                     * handing it the raw register value pointed it at low
-                     * memory: for the Xbox Dashboard, whose pushbuffer is at
-                     * 0x80001000, PUT reads 0x1000 and the survey walked the
-                     * fake TIB. It reported a plausible-looking inventory of
-                     * nothing, which is worse than reporting none -- the
-                     * conclusion drawn was "the title submits no methods"
-                     * while it was submitting them the whole time.
-                     *
-                     * The contiguous window IS the physical-address view, so
-                     * OR-ing its base is the documented round trip, not a
-                     * guess. */
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                        /* Reflect GPU-idle the instant the segment is consumed,
-                         * so the guest's sync-spin clears now rather than a
-                         * scheduler quantum later; and keep the loop hot (no
-                         * yield) while a frame's submits are still streaming. */
-                        gpu_idle_reflect_tick();
-                        hot_until = GetTickCount() + 50;   /* ~50 ms hot window */
-                    }
-                    /* Periodic, because what the title submits at init is not
-                     * what it submits once it is drawing a menu, and the
-                     * question the survey answers is about the latter. */
-                    if (s_nv2a_trace && now_ms - last_report > 10000) {
-                        last_report = now_ms;
-                        nv2a_pb_scan_report();
-                    }
-                }
-                last_put = put; last_put_ms = now_ms;
+            (void)now_ms;                      /* drained at the loop top */
+            if (put != last_put) {
+                last_put = put;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
                  * tells those apart -- D3D waits for GET to reach PUT before it
