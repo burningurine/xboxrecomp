@@ -1,0 +1,4 @@
+{
+ "note": "Blinx code sections: .text, D3D, D3DX, XGRPH, DSOUND, PSGSFD*, XPP (0x12000-0x19853C). The MAPxx/MDLxx sections are level/model data that the XBE flags executable; decoding them produced ~9900 garbage 'functions' (more than half the generated C). No call or jump in real code targets them (xrefs 2026-09-27: only data_read/data_imm). Functions outside these ranges are dropped unless seeded.",
+ "ranges": [["0x00012000", "0x0019853C"]]
+}

@@ -3010,6 +3010,33 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
     return (vector < XBOX_MAX_VECTORS) ? g_connected_isr[vector] : 0;
 }
 
+/* Level-triggered device interrupt lines (e.g. the emulated MCPX APU).
+ *
+ * A device model runs on its own host thread, which has no guest stack or TIB,
+ * so it cannot call the guest ISR itself. It sets or clears its line here, and
+ * the kernel timer thread (which already delivers vblank and runs DPCs) calls
+ * the connected ISR while the line is high. The ISR acknowledges the device,
+ * the device drops the line, and delivery stops -- level semantics. */
+static volatile uint32_t g_irq_lines;
+
+void xbox_SetInterruptLine(uint32_t vector, int level)
+{
+    if (vector >= XBOX_MAX_VECTORS) return;
+    if (level) __atomic_fetch_or(&g_irq_lines, 1u << vector, __ATOMIC_SEQ_CST);
+    else       __atomic_fetch_and(&g_irq_lines, ~(1u << vector), __ATOMIC_SEQ_CST);
+}
+
+static void kernel_device_irq_tick(void)
+{
+    uint32_t lines = __atomic_load_n(&g_irq_lines, __ATOMIC_ACQUIRE);
+    while (lines) {
+        uint32_t v = (uint32_t)__builtin_ctz(lines);
+        lines &= lines - 1;
+        if (xbox_GetConnectedInterrupt(v))
+            kernel_raise_interrupt(v);
+    }
+}
+
 /* ── MmClaimGpuInstanceMemory (ordinal 168) ───────────────
  * PVOID MmClaimGpuInstanceMemory(SIZE_T NumberOfBytes, SIZE_T *Padding)
  *
@@ -3177,6 +3204,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         pcsample_tick();       /* opt-in: one-shot thread-context PC sampler */
         gpu_idle_tick();       /* opt-in: reflect NV2A GPU-idle regs (test harness) */
         fs_log_tick();         /* 1 Hz [STATS] line (frame_stats.c) */
+        kernel_device_irq_tick(); /* level-triggered device lines (APU) */
         ts_misc = (long long)GetTickCount64();
         now = ts_misc;
 
