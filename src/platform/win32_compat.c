@@ -37,6 +37,23 @@
 #include <sys/sysinfo.h>
 #endif
 
+/* ---- Android (Bionic) compatibility ----------------------------------
+ * Two generic POSIX primitives this file uses are missing on Bionic:
+ *   - pthread_cancel: Bionic omits it by design. Its only caller here is
+ *     TerminateThread, which marks the thread object exited/signaled right
+ *     after this returns, so a best-effort no-op is safe for bring-up.
+ *   - explicit_bzero: not exposed through the headers we include on Bionic;
+ *     provide a compiler-barrier memset equivalent.
+ * Added for the aarch64/Android (NDK) port -- see docs/blinx-apk-notes.md. */
+#if defined(__ANDROID__)
+static inline void recomp_explicit_bzero(void *p, size_t n) {
+    volatile unsigned char *q = (volatile unsigned char *)p;
+    while (n--) *q++ = 0;
+}
+#define explicit_bzero(p, n) recomp_explicit_bzero((p), (n))
+static inline int pthread_cancel(pthread_t t) { (void)t; return 0; }
+#endif /* __ANDROID__ */
+
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
 /* ===================================================================== */
@@ -280,6 +297,11 @@ typedef struct w32_object {
     DWORD           exit_code;
     int             suspend_count;
     pthread_cond_t  gate;
+    /* Cross-thread (mid-run) suspend via signals -- see SuspendThread. Async
+     * flags only: sig_park_req mirrors "suspend_count > 0", sig_parked tells the
+     * suspender the target is actually parked in the handler. */
+    volatile sig_atomic_t sig_park_req;
+    volatile sig_atomic_t sig_parked;
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
@@ -463,6 +485,7 @@ static DWORD wait_single(w32_object *o, DWORD ms)
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
 
+    int logged_block = 0;
     for (;;) {
         int ready = 0;
         switch (o->kind) {
@@ -476,6 +499,21 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         default:       ready = 1; break;
         }
         if (ready) break;
+
+        /* Diagnostic (RECOMP_WAIT_LOG): the actual host PARK point for every
+         * backed wait — Ke, Nt, or raw Win32 all funnel here. Logged once per
+         * wait, with the real gettid(), so a thread that hangs shows exactly
+         * which object+kind it blocked on (complements the Ke-only KEDIAG at the
+         * bridge entry). Silence here for a hung thread => it is NOT a backed
+         * host wait (a spin-poll or a critical-section pthread_mutex instead). */
+        if (!logged_block && getenv("RECOMP_WAIT_LOG")) {
+            logged_block = 1;
+            fprintf(stderr, "  [WAITLOG] BLOCK tid=%d obj=%p kind=%d ms=%d "
+                    "ev_sig=%d sem=%d mtx_own=%u\n",
+                    gettid(), (void *)o, (int)o->kind, (int)ms,
+                    o->signaled, o->sem_count, (unsigned)o->mtx_owner);
+            fflush(stderr);
+        }
 
         /* An armed timer has its own deadline. Waiting on the caller's alone
          * would sleep straight past the due time, so take whichever comes
@@ -690,11 +728,100 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* Real cross-thread (mid-run) suspension on POSIX, via signals.
+ *
+ * The Xbox thread pool parks its worker threads by having the MAIN thread call
+ * SuspendThread(worker) and later ResumeThread(worker) -- cross-thread. POSIX
+ * has no primitive to pause an arbitrary running thread, so this was a no-op,
+ * and the workers ran to completion and terminated instead of parking for
+ * reuse; the intro then had no live worker to service its item and hung. The
+ * standard technique: a dedicated signal whose handler, running IN the target,
+ * blocks in sigsuspend until a resume signal wakes it. RESUME is blocked while
+ * the suspend handler runs (sa_mask), so a resume racing just ahead of the
+ * sigsuspend stays pending and is delivered atomically when sigsuspend unblocks
+ * it -- no lost wakeup.
+ *
+ * Gated behind RECOMP_XSUSPEND (default OFF) so it cannot change behaviour
+ * unless asked: with it off, cross-thread SuspendThread stays count-only exactly
+ * as before. RT signal numbers are a guess for Android/Bionic (SIGRTMIN is
+ * shifted past the runtime's reserved ones); if +2/+3 collide, override with
+ * RECOMP_XSUSPEND_SIG=<base>. Risks to watch: EINTR on a syscall the target was
+ * in, and suspending a thread that holds a lock -- the pool parks its workers
+ * when idle, which avoids both, but they are why this is opt-in. */
+#ifdef __linux__
+static int w32_xsuspend_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = getenv("RECOMP_XSUSPEND") ? 1 : 0;
+    return e;
+}
+static int w32_sig_suspend(void)
+{
+    static int s = -1;
+    if (s < 0) {
+        const char *o = getenv("RECOMP_XSUSPEND_SIG");
+        int base = (o && atoi(o) > 0) ? atoi(o) : (SIGRTMIN + 2);
+        s = base;
+    }
+    return s;
+}
+static int w32_sig_resume(void) { return w32_sig_suspend() + 1; }
+
+static void w32_suspend_handler(int sig)
+{
+    (void)sig;
+    int saved = errno;
+    w32_object *o = t_self_obj;
+    if (o) {
+        sigset_t wait_mask;
+        sigfillset(&wait_mask);
+        sigdelset(&wait_mask, w32_sig_resume());   /* only RESUME may wake us */
+        o->sig_parked = 1;
+        while (o->sig_park_req)
+            sigsuspend(&wait_mask);                 /* atomic unblock+wait */
+        o->sig_parked = 0;
+    }
+    errno = saved;
+}
+static void w32_resume_handler(int sig) { (void)sig; }  /* just interrupts sigsuspend */
+
+static void w32_ensure_suspend_signals(void)
+{
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = w32_suspend_handler;
+        sigfillset(&sa.sa_mask);                    /* block everything in-handler */
+        sigaction(w32_sig_suspend(), &sa, NULL);
+    }
+    {
+        struct sigaction sr;
+        memset(&sr, 0, sizeof(sr));
+        sr.sa_handler = w32_resume_handler;
+        sigemptyset(&sr.sa_mask);
+        sigaction(w32_sig_resume(), &sr, NULL);
+    }
+}
+#endif /* __linux__ */
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+    /* Diagnostic (RECOMP_THREAD_LOG): confirm every pthread actually starts and
+     * runs its start routine on Android. Guest worker threads spawn through here
+     * (start == bridge_thread_main); if this never fires from a new OS tid, the
+     * pool workers are not executing. Cheap: one line per thread creation. */
+    if (getenv("RECOMP_THREAD_LOG")) {
+        fprintf(stderr, "  [W32THREAD] trampoline ENTER ostid=%d w32tid=%u start=%p\n",
+                gettid(), (unsigned)o->tid, (void *)(uintptr_t)o->start);
+        fflush(stderr);
+    }
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -777,22 +904,89 @@ DWORD ResumeThread(HANDLE h)
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
-    if (o->suspend_count > 0 && --o->suspend_count == 0)
-        pthread_cond_broadcast(&o->gate);
+    int woke = 0;
+    if (o->suspend_count > 0 && --o->suspend_count == 0) {
+        pthread_cond_broadcast(&o->gate);   /* wakes the self-suspend / start-gate */
+        o->sig_park_req = 0;                 /* count hit 0: release a cross-thread park */
+        woke = 1;
+    }
     pthread_mutex_unlock(&o->lock);
+#ifdef __linux__
+    /* Wake a cross-thread parked target: clear the request (above) then interrupt
+     * its sigsuspend. RESUME was blocked while the suspend handler ran, so if it
+     * races just ahead of the sigsuspend it stays pending and is delivered when
+     * sigsuspend unblocks it -- no lost wakeup. */
+    if (woke && w32_xsuspend_enabled() && o->sig_parked)
+        pthread_kill(o->thread, w32_sig_resume());
+#endif
     return prev;
 }
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    /* Real SELF-suspension. A thread suspending ITSELF blocks on the same gate
+     * the CREATE_SUSPENDED start-gate and ResumeThread use, until the count
+     * returns to 0 (ResumeThread broadcasts that gate). The Xbox thread pool
+     * relies on exactly this: each worker loops "process work, then
+     * NtSuspendThread(self)" to sleep until the submitter calls NtResumeThread.
+     * Leaving suspend a no-op meant the workers never blocked, so the pool's
+     * suspend/resume handshake broke and the intro's wait-for-completion
+     * (sub_000F97B0 spinning on flag [0x4240f8]) never cleared -> the freeze.
+     * The while-loop re-checks the count, so a resume that races just ahead of
+     * the suspend is not lost. Suspending ANOTHER thread mid-run is still
+     * unsupported on POSIX (it needs a signal), but this pool -- and the common
+     * case -- only ever suspends self. */
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (!o || o->kind != K_THREAD) {
+        if (getenv("RECOMP_THREAD_LOG")) {
+            fprintf(stderr, "  [W32THREAD] SuspendThread REJECT h=%p o=%p kind=%d "
+                    "(not a thread) ostid=%d\n", (void *)h, (void *)o,
+                    o ? o->kind : -1, gettid());
+            fflush(stderr);
+        }
+        return (DWORD)-1;
+    }
+    /* Is this a self-suspend? The pool self-suspends its workers; only that case
+     * can block on POSIX. Match either the resolved object's thread or the
+     * caller's own self-object, so a differently-tagged handle for the current
+     * thread still counts as self. */
+    int is_self = pthread_equal(o->thread, pthread_self()) || (o == t_self_obj);
+    if (getenv("RECOMP_THREAD_LOG")) {
+        static int n;
+        if (n++ < 40) {
+            fprintf(stderr, "  [W32THREAD] SuspendThread h=%p o=%p self=%d "
+                    "(o->thread==caller=%d o==t_self=%d) count=%d ostid=%d\n",
+                    (void *)h, (void *)o, is_self,
+                    (int)pthread_equal(o->thread, pthread_self()),
+                    (int)(o == t_self_obj), o->suspend_count, gettid());
+            fflush(stderr);
+        }
+    }
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    o->sig_park_req = (o->suspend_count > 0);   /* mirror the count for the handler */
+    if (is_self) {
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
+        pthread_mutex_unlock(&o->lock);
+        return prev;
+    }
     pthread_mutex_unlock(&o->lock);
+#ifdef __linux__
+    /* Cross-thread suspend (opt-in, RECOMP_XSUSPEND): signal the target to park
+     * in the handler. The pool's main thread uses this to park its workers for
+     * reuse; without it they run to completion and die. */
+    if (w32_xsuspend_enabled()) {
+        w32_ensure_suspend_signals();
+        pthread_kill(o->thread, w32_sig_suspend());
+        /* Return only once the target is actually parked -- bounded, so a
+         * lost/ignored signal (e.g. a target with no t_self_obj yet) degrades to
+         * the old no-op instead of hanging the caller. */
+        for (int i = 0; i < 200000 && !o->sig_parked; i++)
+            sched_yield();
+    }
+#endif
     return prev;
 }
 
@@ -1304,9 +1498,21 @@ BOOL ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped)
     (void)overlapped;
     int fd = w32_handle_fd(h);
     if (fd < 0) { if (nread) *nread = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    ssize_t n = read(fd, buf, len);
-    if (n < 0)  { if (nread) *nread = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
-    if (nread)  *nread = (DWORD)n;
+    /* Win32 ReadFile on a file handle fills the whole buffer unless it hits EOF.
+     * POSIX read() may return short (esp. large reads on Android FUSE storage),
+     * so loop. A single read() truncated large save/level loads. */
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = read(fd, (char *)buf + total, (size_t)len - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (total == 0) { if (nread) *nread = 0; SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+            break;
+        }
+        if (n == 0) break;              /* EOF */
+        total += (size_t)n;
+    }
+    if (nread)  *nread = (DWORD)total;
     return TRUE;
 }
 
@@ -1315,9 +1521,19 @@ BOOL WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlap
     (void)overlapped;
     int fd = w32_handle_fd(h);
     if (fd < 0) { if (nwritten) *nwritten = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    ssize_t n = write(fd, buf, len);
-    if (n < 0)  { if (nwritten) *nwritten = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
-    if (nwritten) *nwritten = (DWORD)n;
+    /* Loop to commit the whole buffer -- POSIX write() may be short on FUSE. */
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = write(fd, (const char *)buf + total, (size_t)len - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (total == 0) { if (nwritten) *nwritten = 0; SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+            break;
+        }
+        if (n == 0) break;
+        total += (size_t)n;
+    }
+    if (nwritten) *nwritten = (DWORD)total;
     return TRUE;
 }
 
@@ -1548,7 +1764,20 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
+    int flags  = MAP_SHARED;
+    if (baseAddr) {
+        /* Win32 MapViewOfFileEx at a fixed base FAILS if the range is occupied;
+         * it never stomps. Plain MAP_FIXED does stomp, which silently unmapped
+         * host memory (the base-view fallback loop in xbox_memory_layout.c then
+         * "succeeds" at the first probe and corrupts the process). Use
+         * MAP_FIXED_NOREPLACE so a collision returns NULL and the caller's
+         * next-base / OS-choose fallback runs, matching Win32. (Android port.) */
+#if defined(MAP_FIXED_NOREPLACE)
+        flags |= MAP_FIXED_NOREPLACE;
+#else
+        flags |= MAP_FIXED;
+#endif
+    }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }

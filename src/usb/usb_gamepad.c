@@ -13,7 +13,9 @@
  */
 #include "usb_gamepad.h"
 
+#include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -164,22 +166,67 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[1] = 20;
 
     /* A disconnected host pad is not an error here: the device is present on
-     * the bus either way, it just reports nothing pressed. */
-    if (xbox_InputGetState(0, &state) != 0)
-        return 20;
+     * the bus either way, it just reports nothing pressed -- so build a zeroed
+     * report rather than bailing, which also lets the force-pad test below
+     * drive input on a host with no pad at all. */
+    if (xbox_InputGetState(0, &state) == 0) {
+        g = &state.Gamepad;
+        out[2] = (uint8_t)(g->wButtons & 0xFF);
+        out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
+        for (i = 0; i < 8; i++)
+            out[4 + i] = g->bAnalogButtons[i];
+        out[12] = (uint8_t)(g->sThumbLX & 0xFF);
+        out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
+        out[14] = (uint8_t)(g->sThumbLY & 0xFF);
+        out[15] = (uint8_t)((g->sThumbLY >> 8) & 0xFF);
+        out[16] = (uint8_t)(g->sThumbRX & 0xFF);
+        out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
+        out[18] = (uint8_t)(g->sThumbRY & 0xFF);
+        out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    }
 
-    g = &state.Gamepad;
-    out[2] = (uint8_t)(g->wButtons & 0xFF);
-    out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
-    for (i = 0; i < 8; i++)
-        out[4 + i] = g->bAnalogButtons[i];
-    out[12] = (uint8_t)(g->sThumbLX & 0xFF);
-    out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
-    out[14] = (uint8_t)(g->sThumbLY & 0xFF);
-    out[15] = (uint8_t)((g->sThumbLY >> 8) & 0xFF);
-    out[16] = (uint8_t)(g->sThumbRX & 0xFF);
-    out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
-    out[18] = (uint8_t)(g->sThumbRY & 0xFF);
-    out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    /* Progression test: force a button so an input-gated screen advances with
+     * no real pad. RECOMP_FORCE_PAD=start|a|both (default both). Held only after
+     * a grace period, so the guest first sees "released" and then a press EDGE
+     * -- a title that advances on a Start press, not a level, still fires. */
+    {
+        static int mode = -1;
+        static unsigned calls;
+        if (mode < 0) {
+            const char *s = getenv("RECOMP_FORCE_PAD");
+            if (!s)                              mode = 0;
+            else if (strstr(s, "start"))         mode = 1;
+            else if (strcmp(s, "a") == 0)        mode = 2;
+            else                                 mode = 3;   /* both / anything */
+        }
+        if (mode && ++calls > 180) {
+            if (mode & 1) out[2] |= 0x10;        /* Start (digital bit 4)      */
+            if (mode & 2) out[4]  = 0xFF;        /* A (analog button 0)        */
+        }
+    }
+
+    /* Is the guest actually polling input? This function is only reached when
+     * the guest's USB driver runs an IN transfer on the pad's interrupt
+     * endpoint, so a rising poll count proves the whole input chain (OHCI ->
+     * report -> guest XID driver) is live -- and the button bytes prove the
+     * forced/real press is what the guest reads. RECOMP_PAD_LOG=1. */
+    {
+        static int plog = -1;
+        static unsigned pn, prev_pressed;
+        unsigned pressed;
+        if (plog < 0) plog = getenv("RECOMP_PAD_LOG") != NULL;
+        if (plog) {
+            pressed = out[2] | out[3] | out[4] | out[5] | out[6] | out[7];
+            pn++;
+            if ((pressed && !prev_pressed) || (pn % 1000u) == 0u) {
+                fprintf(stderr, "  [PAD] poll#%u digital=%02X%02X A=%02X B=%02X"
+                        " X=%02X Y=%02X %s\n", pn, out[3], out[2], out[4],
+                        out[5], out[6], out[7],
+                        pressed ? "<-- PRESS reaches guest" : "(idle)");
+                fflush(stderr);
+            }
+            prev_pressed = pressed;
+        }
+    }
     return 20;
 }

@@ -43,6 +43,11 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* The bare disc device with nothing after it: the title opens \Device\CdRom0
+     * itself to get a handle to the volume (Blinx does this at startup and treats
+     * a failure as fatal, rebooting via HalReturnToFirmware). Maps to the game
+     * dir like D:. Listed after the trailing-separator form so sub-paths keep it. */
+    { "\\Device\\CdRom0",                     0, NULL,         NULL          },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -461,6 +466,8 @@ translate:
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <dirent.h>
+#include <strings.h>   /* strcasecmp */
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -493,6 +500,60 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+/* Xbox FATX is case-insensitive; Android/Linux filesystems are not. If 'path'
+ * does not exist exactly as spelled, walk it component by component and repair
+ * the case of each component against the real directory entries. Modifies
+ * 'path' in place. A component with no case-insensitive match is left as
+ * requested (so creating a new save file with a fresh name still works) and the
+ * walk continues from there. The common case -- the path exists as spelled --
+ * returns immediately after a single stat, so this only costs a readdir on an
+ * actual case miss (e.g. the title asks for d:\media\Fonts\Arial_16.tga but the
+ * disc holds Fonts/arial_16.tga). */
+static void casefold_path(char* path)
+{
+    struct stat st;
+    if (!path || !path[0] || stat(path, &st) == 0)
+        return;                              /* empty or already correct */
+
+    char out[MAX_PATH];
+    size_t olen = 0;
+    const char* p = path;
+    if (*p == '/') out[olen++] = *p++;       /* keep any leading slash */
+    out[olen] = '\0';
+
+    while (*p) {
+        char comp[256];
+        size_t clen = 0;
+        while (*p && *p != '/') { if (clen < sizeof(comp) - 1) comp[clen++] = *p; p++; }
+        comp[clen] = '\0';
+        while (*p == '/') p++;
+        if (clen == 0) continue;
+
+        /* Does out/comp exist as spelled? */
+        char cand[MAX_PATH];
+        snprintf(cand, sizeof(cand),
+                 (olen && out[olen - 1] == '/') ? "%s%s" : "%s/%s", out, comp);
+        if (stat(cand, &st) != 0) {
+            /* Scan the parent directory for a case-insensitive match. */
+            DIR* d = opendir(olen ? out : "/");
+            if (d) {
+                struct dirent* e;
+                while ((e = readdir(d)) != NULL) {
+                    if (strcasecmp(e->d_name, comp) == 0) {
+                        snprintf(comp, sizeof(comp), "%s", e->d_name);
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+        }
+        if (olen && out[olen - 1] != '/') out[olen++] = '/';
+        olen += snprintf(out + olen, sizeof(out) - olen, "%s", comp);
+        if (olen >= sizeof(out)) return;     /* overflow: leave path untouched */
+    }
+    snprintf(path, MAX_PATH, "%s", out);
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -591,6 +652,10 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+
+        /* Repair component case against the real filesystem (Xbox FS is
+         * case-insensitive; ours is not). No-op when the path exists as spelled. */
+        casefold_path(host_path_buf);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;

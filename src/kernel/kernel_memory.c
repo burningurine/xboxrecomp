@@ -281,24 +281,67 @@ NTSTATUS __stdcall xbox_NtFreeVirtualMemory(
     PSIZE_T RegionSize,
     ULONG FreeType)
 {
+    /* Arena globals live in xbox_memory_layout.h; extern them locally the way
+     * kernel_bridge.c externs g_xbox_mem_offset, to avoid pulling the whole
+     * header in here. */
+    extern size_t g_xbox_total_ram;   /* total guest RAM */
+    extern size_t g_xbox_map_size;    /* mapping size; 0 = same as RAM */
+    uint32_t guest_va;
+    size_t   ram;
+    int      in_arena;
+
     if (!BaseAddress || !*BaseAddress)
         return STATUS_INVALID_PARAMETER;
 
-    SIZE_T size = (FreeType & MEM_RELEASE) ? 0 : (RegionSize ? *RegionSize : 0);
+    /* The guest is 32-bit and stores Xbox VAs, so the slot BaseAddress points at
+     * holds a 32-bit base value regardless of host word size. Read it as such. */
+    guest_va = *(uint32_t *)BaseAddress;
+    ram = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    in_arena =
+        ((uint64_t)guest_va < (uint64_t)ram) ||
+        (guest_va >= XBOX_CONTIG_BASE &&
+         (uint64_t)guest_va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE);
 
-    if (!VirtualFree(*BaseAddress, size, FreeType)) {
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
-            "NtFreeVirtualMemory failed: base=%p type=0x%X err=%u",
-            *BaseAddress, FreeType, GetLastError());
-        return STATUS_UNSUCCESSFUL;
+    /* Guest RtlFreeHeap decommits/releases segments that live inside the guest
+     * RAM arena. That arena is one file mapping, aliased at the 0x80000000
+     * contiguous window for the 26-bit bus, and we keep it fully committed, so
+     * an arena decommit/release must be a benign SUCCESS no-op -- we must NOT
+     * hand the address to the host allocator. The two hosts fail this oppositely:
+     *   - Windows: VirtualFree can't touch a mapped view -> returns FALSE ->
+     *     STATUS_UNSUCCESSFUL, and the guest heap manager retries the same
+     *     un-decommittable segment forever (an Enter/Free/Leave critical-section
+     *     spin that stalls init right after the first GPU setup batch).
+     *   - Android: VirtualFree(MEM_DECOMMIT) maps to mprotect(PROT_NONE) and
+     *     SUCCEEDS, blanking live guest RAM -- and only the low-VA view, so the
+     *     0x80000000 alias desyncs and the guest faults the moment RtlFreeHeap
+     *     reuses that segment.
+     * Reporting success and leaving the pages live fixes both: the guest updates
+     * its own bookkeeping and moves on. Only a standalone (out-of-arena) host
+     * allocation is freed for real, below. */
+    if (in_arena) {
+        XBOX_TRACE(XBOX_LOG_MEM,
+            "NtFreeVirtualMemory: arena no-op va=0x%08X type=0x%X",
+            guest_va, FreeType);
+        if (FreeType & MEM_RELEASE)
+            *BaseAddress = NULL;
+        return STATUS_SUCCESS;
     }
 
-    XBOX_TRACE(XBOX_LOG_MEM, "NtFreeVirtualMemory(%p, 0x%X)", *BaseAddress, FreeType);
-
-    if (FreeType & MEM_RELEASE)
-        *BaseAddress = NULL;
-
-    return STATUS_SUCCESS;
+    {
+        SIZE_T size = (FreeType & MEM_RELEASE) ? 0
+                                               : (RegionSize ? *RegionSize : 0);
+        if (!VirtualFree(*BaseAddress, size, FreeType)) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+                "NtFreeVirtualMemory failed: base=%p type=0x%X err=%u",
+                *BaseAddress, FreeType, GetLastError());
+            return STATUS_UNSUCCESSFUL;
+        }
+        XBOX_TRACE(XBOX_LOG_MEM, "NtFreeVirtualMemory(%p, 0x%X)",
+                   *BaseAddress, FreeType);
+        if (FreeType & MEM_RELEASE)
+            *BaseAddress = NULL;
+        return STATUS_SUCCESS;
+    }
 }
 
 NTSTATUS __stdcall xbox_NtQueryVirtualMemory(

@@ -194,6 +194,10 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
 
 void xbox_MemoryLayoutShutdown(void);
 
+/* Reload the XBE image to guest memory (clean .data/.bss) for reboot-to-self,
+ * preserving heap, kernel data, the patched thunk table and the launch page. */
+void xbox_MemoryReloadSections(const void *xbe_data, size_t xbe_size);
+
 /**
  * Check if an address falls within the Xbox memory map.
  */

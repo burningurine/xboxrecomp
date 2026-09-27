@@ -132,6 +132,31 @@ BOOLEAN __stdcall xbox_RtlEqualString(
     PXBOX_ANSI_STRING String2,
     BOOLEAN CaseInSensitive)
 {
+    /* Bounded probe: log only when the SEARCH KEY (String1) changes, with a
+     * repeat counter, so a stalled name-lookup shows its sequence compactly
+     * (same key looping = spin; advancing keys = progress). Debug only. */
+    {
+        static char _lastkey[64];
+        static unsigned _keyreps = 0;
+        static int _lines = 0;
+        unsigned l1 = String1->Length > 48 ? 48 : String1->Length;
+        char cur[64];
+        unsigned i;
+        for (i = 0; i < l1 && String1->Buffer; i++) cur[i] = String1->Buffer[i];
+        cur[i] = 0;
+        if (strcmp(cur, _lastkey) != 0) {
+            if (_lines < 4000) {
+                fprintf(stderr, "  [RTLEQ] key='%s' (prev x%u)\n", cur, _keyreps);
+                fflush(stderr);
+                _lines++;
+            }
+            memcpy(_lastkey, cur, sizeof cur);
+            _keyreps = 1;
+        } else {
+            _keyreps++;
+        }
+    }
+
     if (String1->Length != String2->Length)
         return FALSE;
 

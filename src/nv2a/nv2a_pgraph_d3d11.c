@@ -623,6 +623,16 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             method == 0x0110 || method == 0x0114 ||    /* FLIP_MODULO/INCREMENT */
             method == 0x0118)                          /* FLIP_STALL */
         {
+#if defined(__ANDROID__)
+            /* FLIP is the guest's frame boundary. The Windows/D3D11 backend
+             * presents through its own swap chain elsewhere; the GLES backend
+             * presents here, on this (the pushbuffer-scan/draw) thread where
+             * the EGL context is current. */
+            if (method == 0x0118) {
+                IDirect3DDevice8 *dev = xbox_GetD3DDevice();
+                if (dev) dev->lpVtbl->Swap(dev, 0);
+            }
+#endif
             return 1;  /* Silently handled (ignored but acknowledged) */
         }
 

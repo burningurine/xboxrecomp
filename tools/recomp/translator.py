@@ -628,10 +628,10 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
-        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
-        if seh_prolog is None:
+        seh_prologs = getattr(self.lifter, "SEH_PROLOGS", None) or set()
+        if not seh_prologs:
             return False
-        return any(getattr(insn, "call_target", None) == seh_prolog
+        return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
     def translate_function(self, func_addr, func_info):
@@ -787,8 +787,8 @@ class FunctionTranslator:
         # hardcoded to one game's CRT here, so for every other title the forcing
         # silently never fired and the generated C failed to compile with
         # "'ebp': undeclared identifier".
-        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
-                     if a is not None}
+        seh_funcs = set(getattr(self.lifter, "SEH_PROLOGS", ()) or ()) | \
+                    set(getattr(self.lifter, "SEH_EPILOGS", ()) or ())
         if seh_funcs and any(insn.call_target in seh_funcs
                              for insn in instructions):
             used_regs.add("ebp")
@@ -1198,8 +1198,12 @@ class BatchTranslator:
         if seh_prolog is None or seh_epilog is None:
             found_prolog, found_epilog = detect_seh_helpers(
                 self.func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
-            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
+            # detect_seh_helpers returns sets of all variants; a CLI override is
+            # a single address that takes precedence for its role.
+            if seh_prolog is None:
+                seh_prolog = found_prolog
+            if seh_epilog is None:
+                seh_epilog = found_epilog
         self.seh_prolog = seh_prolog
         self.seh_epilog = seh_epilog
 

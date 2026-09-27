@@ -1,0 +1,90 @@
+[
+ {
+  "start": "0x000F35B6",
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001762AE",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001762BA",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001762C6",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00186304",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0018630F",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0018780C",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00187817",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001920E9",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00132620",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00132E70",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00133CD0",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000F9820",
+  "note": "PsCreateSystemThreadEx StartContext1 (pool worker) observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000F9860",
+  "note": "PsCreateSystemThreadEx StartContext1 (pool worker) observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000F98D0",
+  "note": "PsCreateSystemThreadEx StartContext1 (pool worker) observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00127514",
+  "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
+ },
+ {
+  "start": "0x0012768F",
+  "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
+ },
+ {
+  "start": "0x001276C0",
+  "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
+ },
+ {
+  "start": "0x00191763",
+  "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
+ },
+ {
+  "start": "0x000FFC90",
+  "note": "Indirect-call target observed at runtime (round-3 icall-feedback); intro-path fn missed by static discovery."
+ },
+ {
+  "start": "0x00076640",
+  "note": "Indirect-call target observed on device (round-4): scene-9 post-load vtable callback (switch dispatcher). Static discovery mis-identified 0x76626-0x76653 as one garbage fn (jump-table pointer bytes decoded as code) and swallowed this real entry, so recomp_lookup(0x76640) failed -> KeBugCheck -> half-built node tree -> sub_0009D090 walked code addr 0x769B9 -> stuck at scene 0x89. Hand-written into recomp_gap_workers3.c; regen this with the seed to fold it into recomp_0002.c properly."
+ },
+ {
+  "start": "0x000EA1C0",
+  "note": "Indirect-call target observed on device (round-4, 2nd): scene-object state-machine vtable callback. Same class as 0x76640 -- static discovery mis-identified 0x000EA1A2-0x000EA1BF as a garbage fn sub_000EA1A2 (mov edi,edi + a jump-table of 0x000Exxxx ptrs + CC pad) and swallowed this real entry at 0xEA1C0. recomp_lookup(0xEA1C0) failed at scene 0x89. Machine-translated via `recomp -f 0xEA1C0` (has an internal jump table @0xEA310 + FPU) and placed in recomp_gap_workers3.c; regen with the seed to fold it into recomp_0003.c properly."
+ }
+]

@@ -24,8 +24,29 @@
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
 
-#include <SDL.h>
-#include <epoxy/gl.h>
+#if defined(__ANDROID__)
+  /* Android: GLES 3.0 + EGL, rendering into an ANativeWindow (no SDL). The
+   * GL 3.3 backend below is otherwise unchanged; only the window/context
+   * bring-up, buffer-swap, and a couple of format quirks differ. */
+  #include <GLES3/gl3.h>
+  #include <GLES3/gl3ext.h>
+  #include <EGL/egl.h>
+  #include <android/native_window.h>
+  #include <android/log.h>
+  #include <pthread.h>
+  #include <unistd.h>
+  /* GLES exposes the float-suffixed depth entry points, not the desktop names. */
+  #define glClearDepth(z)   glClearDepthf((GLfloat)(z))
+  #define glDepthRange(n,f) glDepthRangef((GLfloat)(n),(GLfloat)(f))
+  #define D3DGL_GLSL_VER   "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+  #define D3DGL_COLOR_SWIZ ".bgra"   /* diffuse arrives as raw BGRA bytes on GLES */
+#else
+  /* Desktop/Linux: OpenGL 3.3 core via SDL2 + libepoxy. */
+  #include <SDL.h>
+  #include <epoxy/gl.h>
+  #define D3DGL_GLSL_VER   "#version 330 core\n"
+  #define D3DGL_COLOR_SWIZ ".rgba"   /* GL_BGRA-sized attrib already delivers RGBA */
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,13 +74,49 @@ void xbox_D3D8SetWindowTitle(const char *title)
 {
     g_window_title = (title && title[0]) ? title : "Xbox Game";
 }
+
+#if defined(__ANDROID__)
+/* The Android Surface (ANativeWindow) the GL context renders into, handed
+ * over from MainActivity through jni_bridge. Guest boot can reach D3D device
+ * creation before the Surface is ready, so d3d_CreateDevice waits on it. */
+static ANativeWindow  *g_anative_win = NULL;
+static pthread_mutex_t  g_win_lock   = PTHREAD_MUTEX_INITIALIZER;
+
+void xbox_D3D8SetAndroidWindow(void *win)
+{
+    pthread_mutex_lock(&g_win_lock);
+    g_anative_win = (ANativeWindow *)win;
+    pthread_mutex_unlock(&g_win_lock);
+    __android_log_print(ANDROID_LOG_INFO, "blinx-gl",
+                        "ANativeWindow %s", win ? "attached" : "cleared");
+}
+
+static ANativeWindow *d3dgl_wait_for_window(void)
+{
+    for (int i = 0; i < 1000; i++) {          /* up to ~10 s */
+        ANativeWindow *w;
+        pthread_mutex_lock(&g_win_lock);
+        w = g_anative_win;
+        pthread_mutex_unlock(&g_win_lock);
+        if (w) return w;
+        usleep(10000);
+    }
+    return NULL;
+}
+#endif
 #define MAX_TSS   33
 #define MAX_TSU   8     /* texture stages */
 
 typedef struct {
     /* Host */
+#if defined(__ANDROID__)
+    EGLDisplay       egl_dpy;
+    EGLSurface       egl_surf;
+    EGLContext       egl_ctx;
+#else
     SDL_Window      *window;
     SDL_GLContext    glctx;
+#endif
     int              backbuf_w;
     int              backbuf_h;
 
@@ -174,7 +231,7 @@ static GLenum gl_cmp(DWORD f)
 /* ======================================================================== */
 
 static const char *VS_SRC =
-    "#version 330 core\n"
+    D3DGL_GLSL_VER
     "layout(location=0) in vec4 a_pos;\n"
     "layout(location=1) in vec4 a_color;\n"
     "layout(location=2) in vec2 a_uv;\n"
@@ -190,12 +247,12 @@ static const char *VS_SRC =
     "       expected to feed already-clip-space coords. */\n"
     "    gl_Position = a_pos;\n"
     "  }\n"
-    "  v_color = a_color;\n"
+    "  v_color = a_color" D3DGL_COLOR_SWIZ ";\n"
     "  v_uv    = a_uv;\n"
     "}\n";
 
 static const char *FS_SRC =
-    "#version 330 core\n"
+    D3DGL_GLSL_VER
     "in  vec4 v_color;\n"
     "in  vec2 v_uv;\n"
     "uniform int       u_use_tex;\n"
@@ -475,9 +532,31 @@ static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *self, UINT lvl)
     if (t->dirty && t->gl_tex) {
         glBindTexture(GL_TEXTURE_2D, t->gl_tex);
         /* First cut: assume BGRA8 layout (matches D3DFMT_A8R8G8B8/X8R8G8B8). */
+#if defined(__ANDROID__)
+        /* GLES3 has no BGRA external format: swap B<->R into a temp RGBA
+         * buffer (memory bytes B,G,R,A -> R,G,B,A). */
+        {
+            size_t n = (size_t)t->width * (size_t)t->height;
+            uint32_t *tmp = (uint32_t *)malloc(n * 4);
+            if (tmp) {
+                const uint32_t *src = (const uint32_t *)t->sys_mem;
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t p = src[i];            /* 0xAARRGGBB */
+                    tmp[i] = (p & 0xFF00FF00u)      /* keep A,G */
+                           | ((p >> 16) & 0x000000FFu)  /* R -> low  */
+                           | ((p & 0x000000FFu) << 16); /* B -> high */
+                }
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                             t->width, t->height, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+                free(tmp);
+            }
+        }
+#else
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
                      t->width, t->height, 0,
                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, t->sys_mem);
+#endif
         t->dirty = FALSE;
     }
     return D3D_OK;
@@ -548,6 +627,10 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
                                      HWND hwnd, void *dirty)
 {
     (void)s;(void)src;(void)dst;(void)hwnd;(void)dirty;
+#if defined(__ANDROID__)
+    if (g.egl_dpy != EGL_NO_DISPLAY && g.egl_surf != EGL_NO_SURFACE)
+        eglSwapBuffers(g.egl_dpy, g.egl_surf);
+#else
     SDL_GL_SwapWindow(g.window);
     /* Pump events so the window stays responsive. Quit closes the window
      * but leaves the process running until the game's loop notices. */
@@ -557,6 +640,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
             fprintf(stderr, "[d3d8_gl] window close requested\n");
         }
     }
+#endif
     return D3D_OK;
 }
 
@@ -679,8 +763,15 @@ static void setup_fvf_attribs(DWORD fvf, UINT stride)
     /* Diffuse: D3DCOLOR (BGRA byte order, normalised to 0..1) */
     if (has_diff) {
         glEnableVertexAttribArray(1);
+#if defined(__ANDROID__)
+        /* GLES3 has no GL_BGRA size: read 4 raw bytes (B,G,R,A) and let the
+         * vertex shader's D3DGL_COLOR_SWIZ (.bgra) reorder to RGBA. */
+        glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride,
+                              (const void *)(uintptr_t)off);
+#else
         glVertexAttribPointer(1, GL_BGRA, GL_UNSIGNED_BYTE, GL_TRUE, stride,
                               (const void *)(uintptr_t)off);
+#endif
         off += 4;
     } else {
         glDisableVertexAttribArray(1);
@@ -975,13 +1066,74 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     (void)s; (void)adapter; (void)devtype; (void)hwnd; (void)flags;
     if (!pp || !pPP) return D3DERR_INVALIDCALL;
 
-    /* Initialise SDL video + GL 3.3 core context. */
-    if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
-
     g.backbuf_w = (int)pPP->BackBufferWidth;
     g.backbuf_h = (int)pPP->BackBufferHeight;
     if (g.backbuf_w <= 0) g.backbuf_w = 640;
     if (g.backbuf_h <= 0) g.backbuf_h = 480;
+
+#if defined(__ANDROID__)
+    /* EGL GLES3 context on the ANativeWindow handed over by MainActivity.
+     * Created on the guest render thread (whichever thread calls CreateDevice),
+     * so GL is current here for every later draw call on this thread. */
+    {
+        ANativeWindow *win = d3dgl_wait_for_window();
+        if (!win) {
+            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+                                "no ANativeWindow after 10s; cannot create GL device");
+            return D3DERR_INVALIDCALL;
+        }
+        EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        EGLint emaj = 0, emin = 0;
+        if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &emaj, &emin)) {
+            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+                                "eglInitialize failed 0x%x", eglGetError());
+            return D3DERR_INVALIDCALL;
+        }
+        const EGLint cfg_attrs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
+            EGL_NONE
+        };
+        EGLConfig cfg; EGLint ncfg = 0;
+        if (!eglChooseConfig(dpy, cfg_attrs, &cfg, 1, &ncfg) || ncfg < 1) {
+            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+                                "eglChooseConfig failed 0x%x", eglGetError());
+            return D3DERR_INVALIDCALL;
+        }
+        EGLint vid = 0;
+        eglGetConfigAttrib(dpy, cfg, EGL_NATIVE_VISUAL_ID, &vid);
+        ANativeWindow_setBuffersGeometry(win, 0, 0, vid);
+
+        const EGLint ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+        EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+        EGLSurface surf = (ctx != EGL_NO_CONTEXT)
+                        ? eglCreateWindowSurface(dpy, cfg, win, NULL) : EGL_NO_SURFACE;
+        if (ctx == EGL_NO_CONTEXT || surf == EGL_NO_SURFACE ||
+            !eglMakeCurrent(dpy, surf, surf, ctx)) {
+            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+                                "EGL context/surface bring-up failed 0x%x", eglGetError());
+            return D3DERR_INVALIDCALL;
+        }
+        eglSwapInterval(dpy, 1);
+        g.egl_dpy = dpy; g.egl_surf = surf; g.egl_ctx = ctx;
+        /* Prefer the actual surface size for the backbuffer/viewport. */
+        {
+            EGLint sw = 0, sh = 0;
+            eglQuerySurface(dpy, surf, EGL_WIDTH, &sw);
+            eglQuerySurface(dpy, surf, EGL_HEIGHT, &sh);
+            if (sw > 0 && sh > 0) { g.backbuf_w = sw; g.backbuf_h = sh; }
+        }
+        __android_log_print(ANDROID_LOG_INFO, "blinx-gl",
+                            "EGL %d.%d  %dx%d  GL %s / GLSL %s", emaj, emin,
+                            g.backbuf_w, g.backbuf_h,
+                            (const char *)glGetString(GL_VERSION),
+                            (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
+    }
+#else
+    /* Initialise SDL video + GL 3.3 core context. */
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -1010,6 +1162,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
 
     fprintf(stderr, "[d3d8_gl] GL %s / GLSL %s\n",
             glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
+#endif
 
     init_gl_pipeline();
 
@@ -1052,6 +1205,28 @@ IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion)
 
 IDirect3DDevice8 *xbox_GetD3DDevice(void)
 {
+#if defined(__ANDROID__)
+    /* Nothing on the guest side calls xbox_Direct3DCreate8 (the guest runs its
+     * own recompiled D3D8 and drives the NV2A via push buffers). The HLE device
+     * this backend provides is what the NV2A pgraph translator draws onto, and
+     * it is first requested from the pushbuffer-scan thread — so lazily create
+     * it here, which brings up the EGL/GLES context current on THIS (the
+     * drawing) thread. */
+    if (!g_device.lpVtbl) {
+        static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&init_lock);
+        if (!g_device.lpVtbl) {
+            D3DPRESENT_PARAMETERS pp;
+            memset(&pp, 0, sizeof(pp));
+            pp.BackBufferWidth  = 640;
+            pp.BackBufferHeight = 480;
+            IDirect3DDevice8 *dev = NULL;
+            d3d_CreateDevice(&g_d3d8, 0, 0, NULL, 0, &pp, &dev);
+        }
+        pthread_mutex_unlock(&init_lock);
+    }
+    if (!g_device.lpVtbl) return NULL;   /* context bring-up failed */
+#endif
     return &g_device;
 }
 

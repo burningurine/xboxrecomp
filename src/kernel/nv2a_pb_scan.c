@@ -177,6 +177,83 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
+                /* Bounded method+arg trace (RECOMP_PB_METHOD_TRACE) to capture
+                 * the exact push-buffer method sequence for GPU bring-up. Off by
+                 * default; stops after a cap so it never floods a long run. */
+                {
+                    static int _mt = -1, _mtn = 0;
+                    if (_mt < 0)
+                        _mt = getenv("RECOMP_PB_METHOD_TRACE") ? 1 : 0;
+                    /* Focus on geometry-range methods (vertex arrays 0x0B00-0x0B7C
+                     * and the 0x1700-0x18FC vertex/begin-end/draw/inline block) so
+                     * the cap is not spent on the per-frame matrix/state setup.
+                     * RECOMP_PB_METHOD_TRACE=all traces everything instead. */
+                    if (_mt && _mtn < 520) {
+                        static int _all = -1, _vp = -1;
+                        int geo;
+                        if (_vp < 0)
+                            _vp = getenv("RECOMP_PB_VP_DUMP") ? 1 : 0;
+                        /* RECOMP_PB_VP_DUMP: capture the VP microcode instead --
+                         * SET_TRANSFORM_PROGRAM words (0x0B00-0x0B7C), the program
+                         * load index (0x1E9C) and draw markers (0x1810). */
+                        if (_vp)
+                            geo = (m >= 0x0B00 && m <= 0x0B7C)
+                               || (m == 0x1E9C) || (m == 0x1810);
+                        else
+                        /* Vertex arrays / BEGIN_END / draws (0x1700-0x18FC),
+                         * transform-execution-mode (0x1E94), the composite matrix
+                         * (0x0680-0x06BC), viewport offset (0x0A20-0x0A2C) and
+                         * viewport scale (0x0AF0-0x0AFC), plus the transform
+                         * constants (0x0B80-0x0BFC + 0x1EA4 load). NOT the 0x0B00
+                         * TRANSFORM_PROGRAM microcode unless RECOMP_PB_VP_DUMP. */
+                        geo = (m >= 0x1700 && m <= 0x18FC) || (m == 0x1E94)
+                               || (m >= 0x0680 && m <= 0x06BC)
+                               || (m >= 0x0A20 && m <= 0x0A2C)
+                               || (m >= 0x0AF0 && m <= 0x0AFC)
+                               || (m == 0x1EA4)                 /* const load idx */
+                               || (m >= 0x0B80 && m <= 0x0BFC); /* transform consts */
+                        if (_all < 0) {
+                            const char *e = getenv("RECOMP_PB_METHOD_TRACE");
+                            _all = (e && !strcmp(e, "all")) ? 1 : 0;
+                        }
+                        if (_all || geo) {
+                            _mtn++;
+                            fprintf(stderr,
+                                    "  [PBM] subch=%u m=0x%04X p=0x%08X\n",
+                                    subch, m, *(const uint32_t *)(mem + va));
+                            fflush(stderr);
+                        }
+                    }
+                }
+                /* Per-draw context: for the first several DRAW_ARRAYS, log the
+                 * active texture offset (0x1B00), transform-execution-mode
+                 * (0x1E94) and vertex-array offset (0x1720) + vertex0 position,
+                 * so the batch using a given texture (e.g. the 128x256 startup
+                 * art) can be found with its exact transform inputs. */
+                if (getenv("RECOMP_PB_METHOD_TRACE")) {
+                    static uint32_t _voff = 0, _tex = 0, _mode = 0, _vpstart = 0;
+                    static uint32_t _vsx = 0, _vsy = 0, _vox = 0, _voy = 0;
+                    static int _nd = 0;
+                    if (m == 0x1720) _voff = *(const uint32_t *)(mem + va);
+                    if (m == 0x1B00) _tex  = *(const uint32_t *)(mem + va);
+                    if (m == 0x1E94) _mode = *(const uint32_t *)(mem + va);
+                    if (m == 0x1EA0) _vpstart = *(const uint32_t *)(mem + va);
+                    if (m == 0x0AF0) _vsx = *(const uint32_t *)(mem + va);
+                    if (m == 0x0AF4) _vsy = *(const uint32_t *)(mem + va);
+                    if (m == 0x0A20) _vox = *(const uint32_t *)(mem + va);
+                    if (m == 0x0A24) _voy = *(const uint32_t *)(mem + va);
+                    if (m == 0x1810 && _nd < 16) {
+                        float sx, sy, ox, oy;
+                        memcpy(&sx, &_vsx, 4); memcpy(&sy, &_vsy, 4);
+                        memcpy(&ox, &_vox, 4); memcpy(&oy, &_voy, 4);
+                        int _nd2 = ++_nd;
+                        fprintf(stderr,
+                            "  [DRAW#%d] tex=0x%08X mode=0x%X vp_start=%u"
+                            " vp_scale=(%.2f,%.2f) vp_off=(%.2f,%.2f)\n", _nd2,
+                            _tex, _mode & 3u, _vpstart, sx, sy, ox, oy);
+                        fflush(stderr);
+                    }
+                }
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */

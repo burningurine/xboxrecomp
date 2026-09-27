@@ -202,9 +202,13 @@ static HRESULT d3d11_create_device_and_swap_chain(
     UINT create_flags = 0;
     HRESULT hr;
 
-#ifdef _DEBUG
-    create_flags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
+    /* The D3D11 debug layer (D3D11SDKLayers.dll) is the optional Windows
+     * "Graphics Tools" feature, absent on most machines; requesting it when
+     * missing fails device creation with DXGI_ERROR_SDK_COMPONENT_MISSING
+     * (0x887A002D). Make it explicit opt-in via RECOMP_D3D_DEBUG instead of
+     * tying it to the _DEBUG build. */
+    if (getenv("RECOMP_D3D_DEBUG"))
+        create_flags |= D3D11_CREATE_DEVICE_DEBUG;
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
@@ -1472,6 +1476,52 @@ static const IDirect3DDevice8Vtbl g_device_vtbl = {
 
 IDirect3DDevice8 *xbox_GetD3DDevice(void)
 {
+    /* Blinx (like many titles) never calls Direct3DCreate8/CreateDevice through
+     * the HLE -- it drives its own recompiled D3D8 and writes pushbuffers, and
+     * the HLE device is only the surface nv2a_pgraph draws onto. So create it
+     * lazily on first use (from the pushbuffer-scan/draw thread; D3D11 is not
+     * thread-affine, unlike GL). A plain top-level window hosts the swap chain.
+     * Env RECOMP_NO_AUTODEV skips this (keeps the old NULL behaviour). */
+    if (!g_device_initialized) {
+        static int s_tried = 0;
+        if (s_tried || getenv("RECOMP_NO_AUTODEV")) return NULL;
+        s_tried = 1;
+
+        WNDCLASSA wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc   = DefWindowProcA;
+        wc.hInstance     = GetModuleHandleA(NULL);
+        wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        wc.lpszClassName = "BlinxRecompWnd";
+        RegisterClassA(&wc);
+
+        HWND hwnd = CreateWindowExA(
+            0, "BlinxRecompWnd", "BLiNX: The Time Sweeper (recomp)",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT, CW_USEDEFAULT, 640, 480,
+            NULL, NULL, wc.hInstance, NULL);
+
+        D3DPRESENT_PARAMETERS pp;
+        memset(&pp, 0, sizeof(pp));
+        pp.BackBufferWidth       = 640;
+        pp.BackBufferHeight      = 480;
+        pp.BackBufferFormat      = D3DFMT_X8R8G8B8;
+        pp.BackBufferCount       = 1;
+        pp.SwapEffect            = D3DSWAPEFFECT_DISCARD;
+        pp.hDeviceWindow         = hwnd;
+        pp.Windowed              = TRUE;
+        pp.EnableAutoDepthStencil = TRUE;
+        pp.AutoDepthStencilFormat = D3DFMT_D24S8;
+
+        IDirect3D8 *d3d = xbox_Direct3DCreate8(0);
+        IDirect3DDevice8 *dev = NULL;
+        HRESULT hr = d3d->lpVtbl->CreateDevice(d3d, 0, 1 /*D3DDEVTYPE_HAL*/,
+                                               hwnd, 0, &pp, &dev);
+        if (FAILED(hr))
+            fprintf(stderr, "D3D8: lazy device create failed 0x%08lX\n", (unsigned long)hr);
+        else
+            fprintf(stderr, "D3D8: lazy device+window created for nv2a_pgraph\n");
+    }
     return g_device_initialized ? &g_device : NULL;
 }
 

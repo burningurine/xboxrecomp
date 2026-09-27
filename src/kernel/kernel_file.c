@@ -799,17 +799,53 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
-        fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
+        int oflags = posix_open_flags(DesiredAccess, CreateDisposition);
+        fd = open(host_path, oflags, 0644);
+        if (fd < 0 && (oflags & O_CREAT) && errno == ENOENT) {
+            /* A create / open-if whose PARENT directory is missing: POSIX open()
+             * will not make it, so the Xbox save path (Partition5 -> files/Cache/
+             * pelon*.rec, created on first access) never comes into being and the
+             * title blocks waiting on a save it cannot write (Blinx file_select
+             * hung here on Android). Create the parents mkdir -p, as the app (so
+             * they are app-owned + writable -- a shell-made dir has the wrong uid
+             * and open() EACCESes), then retry once -- mirrors the DIRECTORY_FILE
+             * branch above. */
+            char dir[MAX_PATH];
+            char *sl;
+            snprintf(dir, sizeof(dir), "%s", host_path);
+            sl = strrchr(dir, '/');
+            if (sl && sl != dir) {
+                char *p;
+                *sl = '\0';                       /* dir = parent directory */
+                for (p = dir + 1; *p; p++) {
+                    if (*p == '/') { *p = '\0'; mkdir(dir, 0777); *p = '/'; }
+                }
+                mkdir(dir, 0777);                 /* the leaf parent */
+                fd = open(host_path, oflags, 0644);
+            }
+        }
+        { static int np, nf;   /* temp diag: first 24 opens + non-pelon failed opens. pelonNNN.rec is the
+                                  save-slot enumeration scan (hundreds of expected-missing empty slots) which
+                                  otherwise exhausts the cap and hides the interesting scene-9 warp-resource
+                                  file-not-found — so skip pelon* in the failure log. */
+          int is_pelon = (strstr(host_path, "pelon") != NULL);
+          if (np++ < 24 || (fd < 0 && !is_pelon && nf++ < 300)) {
+            fprintf(stderr, "  [NCFPROBE] %s disp=%u oflags=0x%X fd=%d errno=%d path='%s'\n",
+                    (fd < 0 ? "FAIL" : "ok"), (unsigned)CreateDisposition, oflags, fd,
+                    (fd < 0 ? errno : 0), host_path);
+            fflush(stderr); } }
     }
 
     if (fd < 0) {
         int e = errno;
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        NTSTATUS st = errno_to_status(e);
+        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d -> 0x%08X)",
+                   host_path, e, (unsigned)st);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
-            IoStatusBlock->Information = 0;
+            IoStatusBlock->Status = st;   /* was hardcoded NAME_NOT_FOUND: report */
+            IoStatusBlock->Information = 0;  /* the real reason (EACCES != absent) */
         }
-        return errno_to_status(e);
+        return st;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
@@ -839,16 +875,43 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = read(fd, Buffer, Length);
-    if (n < 0) {
-        XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
-        IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
-        IoStatusBlock->Information = 0;
-        return STATUS_UNSUCCESSFUL;
+    /* Xbox NtReadFile on a synchronous handle fills the WHOLE buffer (blocking)
+     * unless it hits EOF or a hard error. POSIX read() may return a short count
+     * -- notably on Android FUSE-emulated storage (/storage/emulated/0), where
+     * save files live -- so we must loop. A single read() here left the tail of
+     * the 6000-byte save struct (including its trailing checksum) unfilled, which
+     * failed the guest save-integrity check and blocked the player-select warp. */
+    size_t total = 0;
+    int short_reads = 0;
+    while (total < Length) {
+        ssize_t n = read(fd, (char *)Buffer + total, (size_t)Length - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;   /* retry interrupted read */
+            XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
+            if (total == 0) {
+                IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+                IoStatusBlock->Information = 0;
+                return STATUS_UNSUCCESSFUL;
+            }
+            break;                          /* return the partial data we got */
+        }
+        if (n == 0) break;                  /* genuine EOF */
+        total += (size_t)n;
+        if (total < Length) short_reads++;  /* more wanted -> this was a short read */
+    }
+    if (short_reads > 0) {
+        /* Proof the short-read hypothesis was real: without the loop the caller
+         * would have seen only the first chunk. Bounded so it can't spam. */
+        static int logged = 0;
+        if (logged < 16) {
+            logged++;
+            fprintf(stderr, "  [SHORTREAD] NtReadFile looped %d time(s) to fill %lu bytes (fd=%d)\n",
+                    short_reads, (unsigned long)Length, fd);
+        }
     }
 
-    IoStatusBlock->Information = (ULONG_PTR)n;
-    if (n == 0 && Length > 0) {
+    IoStatusBlock->Information = (ULONG_PTR)total;
+    if (total == 0 && Length > 0) {
         IoStatusBlock->Status = STATUS_END_OF_FILE;
         return STATUS_END_OF_FILE;
     }
@@ -875,16 +938,27 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = write(fd, Buffer, Length);
-    if (n < 0) {
-        XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
-        IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
-        IoStatusBlock->Information = 0;
-        return STATUS_UNSUCCESSFUL;
+    /* Mirror the read path: POSIX write() may be short (FUSE storage), so loop
+     * until the whole buffer is committed to avoid truncated/corrupt saves. */
+    size_t total = 0;
+    while (total < Length) {
+        ssize_t n = write(fd, (const char *)Buffer + total, (size_t)Length - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;   /* retry interrupted write */
+            XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
+            if (total == 0) {
+                IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+                IoStatusBlock->Information = 0;
+                return STATUS_UNSUCCESSFUL;
+            }
+            break;                          /* partial write committed */
+        }
+        if (n == 0) break;                  /* no progress; avoid infinite loop */
+        total += (size_t)n;
     }
 
     IoStatusBlock->Status = STATUS_SUCCESS;
-    IoStatusBlock->Information = (ULONG_PTR)n;
+    IoStatusBlock->Information = (ULONG_PTR)total;
     if (Event) SetEvent(Event);
     return STATUS_SUCCESS;
 }

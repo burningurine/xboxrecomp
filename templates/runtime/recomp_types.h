@@ -184,6 +184,26 @@ extern RECOMP_TLS uint32_t g_fs_base;
 
 extern RECOMP_TLS uint32_t g_seh_ebp;
 
+/* ---- lifter fallback storage -------------------------------------------
+ * The lifter emits a few identifiers without always declaring them, in code the
+ * aggressive "function after a ret" recovery pass turns up (mostly mis-recovered
+ * data/garbage that never executes):
+ *   _flags            - the string-op / loop condition temporary (repe scasb,
+ *                       loopne). Most functions declare a local `int _flags=0;`
+ *                       which SHADOWS this global, so per-function behaviour is
+ *                       preserved; only functions missing that local fall back.
+ *   cr0..cr7, dr0..dr7 - control/debug registers (privileged mov cr0,eax etc.).
+ *                       Write-only scratch here; a real title never touches them.
+ *   ax..sp            - bare 16-bit register targets the lifter emitted instead
+ *                       of a LO16 view (e.g. POP32(esp, si)); decoupled from the
+ *                       e-registers, which only matters in code that never runs.
+ * Declaring them lets the generated C compile; thread-local to match the
+ * register model. Definitions live in the per-title recomp_manual.c. */
+extern RECOMP_TLS uint32_t _flags;
+extern RECOMP_TLS uint32_t cr0, cr1, cr2, cr3, cr4, cr5, cr6, cr7;
+extern RECOMP_TLS uint32_t dr0, dr1, dr2, dr3, dr4, dr5, dr6, dr7;
+extern RECOMP_TLS uint32_t ax, bx, cx, dx, si, di, bp, sp;
+
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
  * A recompiled function is a real C function, so restoring the guest esp is

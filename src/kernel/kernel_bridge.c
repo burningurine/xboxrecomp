@@ -415,6 +415,16 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
+    /* Entry probe: bridge_thread_main is worker-only (the main thread runs the
+     * game inline via the first PsCreateSystemThreadEx). If this fires, the
+     * pthread started and is about to run the guest routine; if it NEVER fires
+     * on a build where the game spawns workers, the thread never started or the
+     * CreateThread trampoline didn't reach here (the on-device pool-not-running
+     * gate). Logged before fn() so a routine that blocks still shows entry. */
+    fprintf(stderr, "  [KERNEL] worker thread ENTER: ctx1=0x%08X ctx2=0x%08X "
+            "stack_top=0x%08X\n", ctx1, ctx2, s->stack_top);
+    fflush(stderr);
+
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
      * The TIB carries the SEH chain head and, through fs:[4], the CRT's
@@ -681,6 +691,13 @@ static void bridge_MmAllocateSystemMemory(void)
  * has to be honoured rather than satisfied from the general heap. */
 #define XBOX_PHYSICAL_MIRROR_BASE 0x80000000u
 
+/* Texture-staging window, defined in xbox_memory_layout.c. Declared locally
+ * (not in xbox_memory_layout.h) so this routing change doesn't force a rebuild
+ * of the huge recompiled-gen TUs that include that header transitively. */
+extern uint32_t xbox_StagingAlloc(uint32_t size, uint32_t alignment);
+extern void     xbox_StagingFree(uint32_t xbox_va);
+extern int      xbox_StagingContains(uint32_t xbox_va);
+
 static void bridge_MmAllocateContiguousMemoryEx(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -720,6 +737,29 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
         return;
     }
 
+    /* Split on the RAW alignment, before the 4 KB minimum below. D3DX texture
+     * surfaces arrive with align 0x80; framebuffers/pushbuffers with 16384. Only
+     * the scan-out buffers need to live in the 64 MB physical mirror (fb_present
+     * reads them, and a future NV2A would); a texture surface is write-only on
+     * the Android build (no GL pgraph), so route it to the off-mirror staging
+     * window instead. The mirror was starving -- the ~50 MB resident image bump
+     * leaves ~14 MB, which framebuffers + a few textures exhaust, and the next
+     * 64 KB texture failed, hanging the warp screen on a half-built resource.
+     * If staging is full/unavailable it returns 0 and we fall through to the
+     * mirror, so a texture alloc still succeeds where it can. */
+    if (align < 4096) {
+        xbox_va = xbox_StagingAlloc(size, align);
+        if (xbox_va) {
+            if (KERNEL_LOG_ON_HALF()) {
+                fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → STAGING Xbox VA 0x%08X (off-mirror)\n",
+                        size, align, xbox_va);
+                fflush(stderr);
+            }
+            g_eax = xbox_va;
+            return;
+        }
+    }
+
     if (align < 4096) align = 4096;
     xbox_va = xbox_ContiguousAlloc(size, align);
 
@@ -735,10 +775,29 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 /* ── MmFreeContiguousMemory (ordinal 171) ─────────────────
  * VOID MmFreeContiguousMemory(PVOID BaseAddress)
  */
+/* Declared locally (not in xbox_memory_layout.h) so touching this reclaim path
+ * doesn't force a rebuild of the huge recompiled-gen TUs that include that
+ * header transitively. Defined in xbox_memory_layout.c. */
+extern void xbox_ContiguousFree(uint32_t xbox_va);
+
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    /* Contiguous memory comes from xbox_ContiguousAlloc (the 64 MB physical-
+     * mirror window), NOT xbox_HeapAlloc. Freeing it via xbox_HeapFree never
+     * matched the window's block table, so every free was a no-op and the arena
+     * leaked to the ceiling -- a 256x256 DXT5's 0x10000 texture buffer then
+     * failed with the general heap still mostly free. Route to the window's own
+     * free-list so blocks are reclaimed. (A stray heap address would be a no-op
+     * here, same as the old path was for a contiguous one.) */
+    { static int n; if (n++ < 40) { fprintf(stderr, "  [CFREE] MmFreeContiguousMemory #%d addr=0x%08X\n", n, addr); fflush(stderr); } }
+    /* Texture surfaces now live in the off-mirror staging window; scan-out
+     * buffers stay in the mirror. Route the free to the arena that owns the
+     * address so each one's free-list is maintained (see bridge_Mm...Ex). */
+    if (xbox_StagingContains(addr))
+        xbox_StagingFree(addr);
+    else
+        xbox_ContiguousFree(addr);
     g_eax = 0;
 }
 
@@ -947,8 +1006,13 @@ static void bridge_NtQueryVirtualMemory(void)
     BRIDGE_MEM32(info_va + 0x14) = 0x04;               /* Protect */
     BRIDGE_MEM32(info_va + 0x18) = 0x20000;            /* MEM_PRIVATE */
 
-    if (page_base >= g_xbox_code_lo && page_base < XBOX_TOTAL_RAM) {
-        BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
+    /* The committed region is the whole MAPPED range, not just reported RAM:
+     * a large-image title (Blinx) maps 128 MB so its guest heap lives above the
+     * ~50 MB image, and the CRT's realloc/heap-walk probes those >64 MB pointers
+     * via this call — reporting them MEM_FREE would fail the block lookup. */
+    uint32_t mapped_top = (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
+    if (page_base >= g_xbox_code_lo && page_base < mapped_top) {
+        BRIDGE_MEM32(info_va + 0x0C) = mapped_top - page_base; /* RegionSize */
         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
     } else {
         BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
@@ -1094,6 +1158,38 @@ static void bridge_ExQueryNonVolatileSetting(void)
  *
  * It never returns on hardware. Returning here would let the game run on past
  * a decision to quit, which reads as a hang rather than an exit. */
+/* Host reboot hook: set by the host (android_main.c) to implement reboot-to-self.
+ * Xbox titles commonly XLaunchNewImage(self) at startup to reboot into a clean
+ * 64 MB with themselves as the launched title. When set, it is called for a
+ * quick-reboot (routine 2) BEFORE the process is torn down, and may longjmp back
+ * to the host's entry loop (not returning) to re-run the guest. */
+void (*g_recomp_reboot_hook)(uint32_t routine) = 0;
+
+/* Reset the per-run kernel counters a real reboot would clear. Called by the
+ * host between a reboot-to-self and re-entering the guest. Keeps the thunk
+ * table, memory image and launch data (which the relaunch is meant to read). */
+void xbox_kernel_soft_reset(void)
+{
+    g_thread_call_count = 0;
+    g_kernel_call_count = 0;
+}
+
+/* The current launch-data page pointer (KDATA_LAUNCH_DATA_PAGE). Non-zero means
+ * a title set it before a reboot-to-self; the host logs it per boot to see
+ * whether a relaunch is presenting the "already rebooted" signal. */
+uint32_t xbox_kernel_launch_page(void)
+{
+    return BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+}
+
+/* Re-establish the launch-data page pointer after a reboot-to-self reload, the
+ * way real hardware's kernel restores it from the persisted page. Without this
+ * a relaunched title reads a NULL page and treats every boot as a cold boot. */
+void xbox_kernel_set_launch_page(uint32_t page_va)
+{
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page_va;
+}
+
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
@@ -1153,6 +1249,11 @@ static void bridge_HalReturnToFirmware(void)
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
             routine);
     fflush(stderr);
+
+    /* Reboot-to-self: hand off to the host, which may reset guest state and
+     * re-enter (longjmp, not returning) instead of ending the process. */
+    if (g_recomp_reboot_hook)
+        g_recomp_reboot_hook(routine);
 
     /* Write the indirect-branch targets before the process goes away. This
      * path ends in ExitProcess, which does not run atexit handlers, so the
@@ -1319,6 +1420,119 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 
+/* ── vblank wake-path diagnostic (bounded, opt-in) ───────────
+ * Logs distinct guest VAs passed to KeSetEvent ('S') vs the wait
+ * bridges ('W'/'M'), up to 3 samples per distinct VA, so the vblank
+ * DPC's event identity can be compared against what the render thread
+ * actually waits on. If no 'W'/'M' ever prints, the render thread is
+ * polling memory, not waiting on an event. Portable: no OS thread id.
+ * Off unless RECOMP_KEDIAG is set, so it is inert for normal runs. */
+#if !defined(_WIN32)
+#  include <unistd.h>   /* gettid() (bionic/Android) for the KEDIAG thread id */
+#endif
+static void ke_diag_log(char tag, uint32_t va, HANDLE h)
+{
+    static struct { char tag; uint32_t va; unsigned n; } seen[128];
+    static unsigned count;
+    static int on = -1;
+    unsigned i;
+
+    if (on < 0)
+        on = getenv("RECOMP_KEDIAG") != NULL;
+    if (!on)
+        return;
+
+    for (i = 0; i < count; i++)
+        if (seen[i].tag == tag && seen[i].va == va)
+            break;
+    if (i == count) {
+        if (count >= 128)
+            return;
+        seen[count].tag = tag;
+        seen[count].va = va;
+        seen[count].n = 0;
+        count++;
+    }
+    if (seen[i].n < 3) {
+        long tid;
+        int backed;
+#if defined(_WIN32)
+        tid = (long)GetCurrentThreadId();
+#else
+        tid = (long)gettid();
+#endif
+        /* "backed" = h is a real host sync object (from the ke_shadow table),
+         * not the XBOX_TO_NATIVE(va) mapping or the raw guest VA the unbacked
+         * paths hand back. A worker that WAITs an UNBACKED event either
+         * SUCCESS-returns immediately or blocks on a cond nothing signals; a
+         * backed W whose S comes from another tid on the same h should wake. */
+        backed = (h != NULL
+                  && h != (HANDLE)XBOX_TO_NATIVE(va)
+                  && h != (HANDLE)(uintptr_t)va);
+        seen[i].n++;
+        fprintf(stderr, "  [KEDIAG] %c va=0x%08X h=0x%p tid=%ld backed=%d\n",
+                tag, va, (void *)h, tid, backed);
+        fflush(stderr);
+    }
+}
+
+/* ── Lazy-backing for unbacked guest KEVENTs (env-gated: RECOMP_KE_LAZYBACK) ──
+ *
+ * A guest KEVENT never passed to KeInitializeEvent has no ke_shadow entry, so a
+ * wait on it takes the non-blocking STATUS_SUCCESS path (which busy-spins the
+ * caller at 100% CPU) and a KeSetEvent on it only writes the SignalState mirror.
+ * When enabled, the first wait/set on such an event lazily creates a real host
+ * event, keyed by the guest VA in ke_shadow, so the wait BLOCKS and the set
+ * WAKES it -- converting the spin into a real block+wake.
+ *
+ * The wait is bounded (RECOMP_KE_LAZYBACK_MS, default 100 ms): a real SetEvent
+ * wakes it at once, but if the "producer" is something we never deliver (a
+ * DPC/ISR), the wait degrades to today's rate-limited poll rather than a hard
+ * deadlock -- strictly better than a 100%-CPU spin, never worse than now.
+ *
+ * OFF by default: an A/B toggle to confirm the pool-wakeup-spin hypothesis on
+ * device without touching the default path. */
+static int ke_lazyback_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_KE_LAZYBACK") != NULL;
+    return on;
+}
+
+static DWORD ke_lazyback_ms(void)
+{
+    static DWORD ms = 0;
+    if (ms == 0) {
+        const char *s = getenv("RECOMP_KE_LAZYBACK_MS");
+        long v = s ? strtol(s, NULL, 0) : 0;
+        ms = (v > 0 && v <= 5000) ? (DWORD)v : 100;
+    }
+    return ms;
+}
+
+/* Get (creating on first touch) the host event backing an unbacked guest KEVENT.
+ * Honors the dispatcher Type byte: 1 = Synchronization (auto-reset), else
+ * Notification (manual-reset). Seeds the host state from the guest SignalState
+ * mirror so a set that landed before the backing existed is not lost. */
+static HANDLE ke_lazyback_get(uint32_t guest_va)
+{
+    HANDLE h;
+    if (!guest_va)
+        return NULL;
+    h = ke_shadow_lookup(guest_va);
+    if (h)
+        return h;
+    {
+        uint8_t  type = (uint8_t)BRIDGE_MEM8(guest_va + 0);
+        uint32_t sig  = BRIDGE_MEM32(guest_va + 4);
+        BOOL     manual = (type == 1) ? FALSE : TRUE;
+        h = CreateEventW(NULL, manual, sig ? TRUE : FALSE, NULL);
+        if (h)
+            ke_shadow_insert(guest_va, h);
+    }
+    return h;
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -1331,10 +1545,29 @@ static void bridge_KeSetEvent(void)
     (void)wait;
 
     h = ke_shadow_lookup(guest_va);
+    if (!h && ke_lazyback_on())
+        h = ke_lazyback_get(guest_va);   /* real host event so a later wait blocks+wakes */
     if (!h)
         h = bridge_resolve_handle(guest_va);
+    /* An untagged token comes back from bridge_resolve_handle as the RAW guest
+     * VA. That is only a usable host pointer when the guest memory base is low
+     * (the Windows host, offset ~0x10000, so the VA lands inside the mapped
+     * guest window); on Android's high base it is an unmapped low address and
+     * faults inside native SetEvent. A KEVENT here is a guest object POINTER,
+     * so translate it to its host mapping. */
+    if (h == (HANDLE)(uintptr_t)guest_va)
+        h = (HANDLE)XBOX_TO_NATIVE(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
+    ke_diag_log('S', guest_va, h);
+    /* Reflect the signal into the guest KEVENT's SignalState field (+0x04) so
+     * title code that POLLS Event->Header.SignalState (rather than calling a
+     * wait) observes the signal. Previously only the host event was pulsed and
+     * the guest dispatcher header stayed stale -- a worker->main "load done"
+     * handshake that polls SignalState then never completes (the load-warp gate
+     * seen on the RP6: files load in 3.3s, then the scene never transitions). */
+    if (guest_va)
+        BRIDGE_MEM32(guest_va + 4) = 1;
     if (h)
         g_eax = (uint32_t)SetEvent(h);
     else
@@ -1351,11 +1584,62 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
+    /* [SPINWHO] the scene-0x89 main-loop spin waits on the D3D device event
+     * 0x14590C (device_base 0x145778 + 0x194). Dump the guest caller chain
+     * (code VAs on the guest stack) so we can decode the main driver loop + its
+     * post-wait "done" condition (the sync is fine; the condition is unmet).
+     * Device-reachable only (the oracle can't reach 0x89). Bounded. */
+    if (object == 0x0014590Cu) {
+        static int nsw;
+        if (nsw++ < 16) {
+            uint32_t sp = g_esp;
+            fprintf(stderr, "  [SPINWHO] KeWait(0x14590C) #%d esp=0x%08X chain:", nsw, sp);
+            int shown = 0;
+            for (int i = 0; i < 400 && shown < 18; i++) {
+                uint32_t w = BRIDGE_MEM32(sp + (uint32_t)i * 4);
+                if (w >= 0x00012000u && w < 0x00400000u) {
+                    fprintf(stderr, " %08X", w);
+                    shown++;
+                }
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+
     h = ke_shadow_lookup(object);
-    if (!h)
-        h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
+    if (!h) {
+        HANDLE r = bridge_resolve_handle(object);
+        /* An untagged token resolves to the raw guest VA: an UNBACKED guest
+         * dispatcher object (KEVENT etc.), not a real host sync object. Handing
+         * it to the native wait BLOCKS FOREVER on Android -- the POSIX shim
+         * reads the KEVENT bytes as a w32_object and cond-waits on something
+         * nothing signals (the matching KeSetEvent no-ops). On the low-based
+         * Windows oracle the native wait just rejects the bogus handle and
+         * returns at once, so the guest never actually waits on these. Mirror
+         * that -- do NOT block: report the unbacked object already-signaled
+         * (STATUS_SUCCESS) and return, exactly the non-blocking behaviour the
+         * zeromap backstop gave (zeroed object -> kind!=K_EVENT -> fast
+         * success) that reached 2016 draws. (Proper fix = real guest-KEVENT
+         * SignalState sync via ke_shadow-backed host events.) */
+        if (!r || r == (HANDLE)(uintptr_t)object) {
+            ke_diag_log('W', object, r);
+            if (ke_lazyback_on()) {
+                HANDLE lb = ke_lazyback_get(object);
+                if (lb) {
+                    /* Block until a real KeSetEvent wakes us, bounded so a wake
+                     * that never arrives degrades to today's poll, not a hang. */
+                    WaitForSingleObject(lb, ke_lazyback_ms());
+                    g_eax = 0x00000000u;   /* STATUS_SUCCESS (woken or timed out) */
+                    return;
+                }
+            }
+            g_eax = 0x00000000u;   /* STATUS_SUCCESS -- treat as signaled */
+            return;
+        }
+        h = r;
+    }
+    ke_diag_log('W', object, h);
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
@@ -1886,14 +2170,47 @@ typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
 
+/* Timer-thread cycle profiler (RECOMP_TIMER_PROFILE=<ms>, default threshold
+ * 200ms). The frame clock is single-threaded: the timer thread runs the guest
+ * vblank ISR, the queued flip DPC, and due-timer DPCs INLINE, then the present
+ * path (on another thread) waits on the flip those produce. So any one of them
+ * blocking or spinning stalls the whole frame clock and every present-waiter
+ * with it -- the shape of the intermittent multi-second stalls seen on device.
+ * When a cycle (or a single DPC) runs longer than the threshold, log which step
+ * ate the time, and for a DPC its routine VA, so a stall names its culprit.
+ * -1 = uninitialised, 0 = off, 1 = on. Off unless the env var is set. */
+static int       g_timer_profile = -1;
+static long long g_timer_slow_ms = 200;
+
 static void bridge_KeInsertQueueDpc(void)
 {
     uint32_t dpc  = STACK_ARG(0);
     uint32_t arg1 = STACK_ARG(1);
     uint32_t arg2 = STACK_ARG(2);
-    LONG tail, next;
+    LONG tail, next, i;
 
     if (!dpc) { g_eax = 0; return; }
+
+    /* Dedup like the real KeInsertQueueDpc: a KDPC already queued is NOT
+     * re-inserted (it returns FALSE). Blinx's per-frame present re-queues the
+     * SAME flip DPC (0x001457FC, routine 0x0013E260) every present-wait
+     * iteration; without dedup the ring fills with duplicates and the drain --
+     * which empties the whole ring each vblank tick -- runs the flip routine
+     * dozens of times per tick. Each run re-sets the handshake flag the
+     * present-wait polls (device+0x140 = *(ctx+0xB4)), so the guest never
+     * observes it clear and the wait spins forever (file_select boot hang).
+     * Scan the occupied slots [head,tail); if this DPC is already pending,
+     * treat the insert as a no-op. */
+    for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % XBOX_MAX_PENDING_DPC) {
+        if (g_dpc_queue[i].dpc == dpc) {
+            /* Refresh args in case the re-queue carries new SystemArguments,
+             * matching a coalesced insert; then report "already queued". */
+            g_dpc_queue[i].arg1 = arg1;
+            g_dpc_queue[i].arg2 = arg2;
+            g_eax = 0;
+            return;
+        }
+    }
 
     tail = g_dpc_tail;
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
@@ -1908,6 +2225,16 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].arg2 = arg2;
     g_dpc_tail = next;
     g_eax = 1;
+
+    if (getenv("RECOMP_VBLANK_DEBUG")) {
+        static int n;
+        if (n++ < 12) {
+            fprintf(stderr, "  [HANDOFF] KeInsertQueueDpc dpc=0x%08X routine=0x%08X"
+                    " ctx=0x%08X arg1=0x%08X\n",
+                    dpc, BRIDGE_MEM32(dpc + 12), BRIDGE_MEM32(dpc + 16), arg1);
+            fflush(stderr);
+        }
+    }
 }
 
 /* Call a connected interrupt service routine.
@@ -1988,6 +2315,46 @@ static void kernel_vblank_tick(void)
         return;
     next_ms = now + 16;                       /* ~60 Hz */
 
+    /* New-game/save-record trace (RECOMP_SAVETRACE): dump the player-select
+     * substate machine plus the selected slot's magic/mid/checksum vs the
+     * template's, on any change. Shows when the slot record's checksum becomes
+     * valid (matches template) and when it gets invalidated -- to pin the
+     * shared empty-slot->warp bounce (gate sub_00084150 rechecks slot+0x175C). */
+    {
+        static int st = -1;
+        if (st < 0) st = getenv("RECOMP_SAVETRACE") != NULL;
+        if (st) {
+            static uint32_t l_ss=0xFFFFFFFFu, l_scene=0xDEADBEEFu, l_xor=0xDEADBEEFu, l_dirty=0xDEADBEEFu;
+            uint32_t ss    = BRIDGE_MEM32(0x009F6770u);
+            uint32_t slot  = BRIDGE_MEM32(0x009EE7B4u);
+            uint32_t rec   = 0x009EE7C0u + slot * 0x1770u;
+            uint32_t sig   = BRIDGE_MEM32(rec + 0x175Cu);
+            uint32_t dirty = BRIDGE_MEM32(0x009F5D5Cu);   /* sub_00084150 first-check flag */
+            uint32_t scene = BRIDGE_MEM32(0x0051A0FCu);   /* main-loop scene id (&0x7F) */
+            uint32_t targ  = BRIDGE_MEM32(0x0051A144u);   /* warp target (set 5 on gate-pass) */
+            /* The loading-screen loop sub_000A9CE0 exits only when input edge
+             * field +0x4C != 0 (a fresh button press). Trace current buttons
+             * (+0x48) and the edge (+0x4C) at ctrl 0x3FACAC of struct *0x3F09C0
+             * to see if our held-START ever produces the edge at scene 9. */
+            uint32_t in_base = BRIDGE_MEM32(0x003F09C0u);
+            uint32_t in_idx  = BRIDGE_MEM32(0x003FACACu);
+            uint32_t in48 = in_base ? BRIDGE_MEM32(in_base + in_idx * 0x1E4u + 0x48u) : 0;
+            uint32_t in4c = in_base ? BRIDGE_MEM32(in_base + in_idx * 0x1E4u + 0x4Cu) : 0;
+            /* XOR the hashed region rec[0..0x175C) to detect ANY content change the
+             * sparse mag/mid/sig samples miss (the checksum covers exactly this). */
+            uint32_t x = 0;
+            for (uint32_t o = 0; o < 0x175Cu; o += 4u) x ^= BRIDGE_MEM32(rec + o);
+            static uint32_t l_in4c = 0xDEADBEEFu;
+            if (ss != l_ss || scene != l_scene || x != l_xor || dirty != l_dirty || dirty != 0 || in4c != l_in4c) {
+                fprintf(stderr, "  [SAVETRACE] ss=%u 673C=%u pend=%u 5D5C=%u scene=%u targ=%u slot=%u sig=%08X xor=%08X in48=%08X in4c=%08X\n",
+                        ss, BRIDGE_MEM32(0x009F673Cu), BRIDGE_MEM32(0x009EE7B0u), dirty,
+                        scene, targ, slot, sig, x, in48, in4c);
+                fflush(stderr);
+                l_ss = ss; l_scene = scene; l_xor = x; l_dirty = dirty; l_in4c = in4c;
+            }
+        }
+    }
+
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
@@ -1996,13 +2363,429 @@ static void kernel_vblank_tick(void)
 
     {
         static unsigned n;
+        static unsigned n_inv, n_claim, n_decl;
+        static long long last_report;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
+
+        /* Drive the D3D8 vertical-blank callback.
+         *
+         * The title registers a vblank callback (D3DDevice_SetVerticalBlank-
+         * Callback -> sub_00135F80) stored at device+0x1DA8, device = [0x143B58];
+         * its body sub_000A4930 increments the frame counter [0x51A0A0]. On
+         * hardware the D3D8 kernel invokes it every vblank -- but nothing in the
+         * recompiled game or D3D8 lib reads device+0x1DA8, so on our side it was
+         * never called. Measured on device: the ISR claims every vblank (flip
+         * done, DPC queued) yet [0x51A0A0] stays 0, so the per-frame throttle
+         * sub_000A35D0 (`while [0x51A0A0] < 1`) busy-waits ~8.6s per frame
+         * (~0.11 fps -- the intro never finishes). Invoke the registered callback
+         * here on each claimed vblank (claimed => the device is up and a flip
+         * completed), so the heartbeat ticks at the vblank rate and frames pace
+         * normally. The callback ignores its D3DVBLANKDATA* arg and returns with a
+         * plain `ret`; save and restore g_esp so the stack is balanced whatever
+         * the convention. Opt out with RECOMP_NO_VBLANK_CB. */
+        static int flip_kick = -1;
+        if (flip_kick < 0) flip_kick = getenv("RECOMP_FLIP_KICK") != NULL;
+        /* Under RECOMP_FLIP_KICK the callback must fire every vblank, not only on
+         * a claimed one: the kick clears the phantom present-pending below, which
+         * makes the vector-3 ISR sub_0013D8B0 (claims only while [device+0x140]!=0)
+         * go quiet -- so the heartbeat has to stand on its own or [0x51A0A0] stalls. */
+        if (claimed > 0 || flip_kick) {
+            static int cb_off = -1;
+            if (cb_off < 0) cb_off = getenv("RECOMP_NO_VBLANK_CB") != NULL;
+            if (!cb_off) {
+                uint32_t dev = BRIDGE_MEM32(0x00143B58u);
+                uint32_t cb  = dev ? BRIDGE_MEM32(dev + 0x1DA8u) : 0;
+                recomp_func_t cbfn = cb ? recomp_lookup(cb) : NULL;
+                if (!cbfn && cb) cbfn = recomp_lookup_manual(cb);
+                if (cbfn) {
+                    uint32_t saved_esp = g_esp;
+                    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* D3DVBLANKDATA* (unused) */
+                    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* return address */
+                    cbfn();
+                    g_esp = saved_esp;
+                } else {
+                    /* The title's vblank callback (device+0x1DA8) isn't
+                     * registered/resolvable yet. The very first scene load
+                     * (sub_00094A20 file_select -> sub_000A9CE0) throttles on
+                     * [0x51A0A0] BEFORE the game has called
+                     * D3DDevice_SetVerticalBlankCallback, so cb==0, the callback
+                     * body sub_000A4930 never runs, the counter stays 0 and the
+                     * `while [0x51A0A0] < N` busy-wait hangs at boot (seen only
+                     * when thread timing doesn't happen to register the callback
+                     * before this wait, e.g. a vanilla/no-XSUSPEND run). A
+                     * claimed vblank means a real frame elapsed, so beat the
+                     * counter directly here -- exactly what sub_000A4930 would --
+                     * until the callback registers and the branch above resumes.
+                     * dev==0 (device struct not up) is left alone: no flip yet. */
+                    if (dev)
+                        BRIDGE_MEM32(0x0051A0A0u) = BRIDGE_MEM32(0x0051A0A0u) + 1;
+                }
+            }
+        }
+
+        /* RECOMP_FLIP_KICK: clear a phantom "present pending" left by device init.
+         * sub_0013E48D:53924 / sub_0013E510:53995 set [ctx+0xB4]=1 (ctx=0x145778)
+         * and mirror it into [device+0x140] (0xFD000140). A flip retires and clears
+         * that only once one is QUEUED, but file_select (sub_00094A20) gates its
+         * asset load on a present-wait BEFORE it ever calls Swap, so the flip queue
+         * stays empty ([ctx+0x174]/[ctx+0x180]==0), nothing retires, and the wait
+         * deadlocks. Our nv2a renders synchronously (no real async flip to await),
+         * so a pending with no queued entry is a genuine phantom. device+0x140 is
+         * dual-purpose (also the vector-3 ISR sub_0013D8B0's accept gate), so we
+         * DON'T just force it -- the callback above is fired unconditionally under
+         * flip_kick so [0x51A0A0] survives the ISR going quiet, and here we clear
+         * the phantom at its source (ctx+0xB4) plus the mirror. Guarded to the
+         * pre-scene-0 boot wait with no flip ever queued, so it self-disables the
+         * instant a real flip or scene appears. Off unless RECOMP_FLIP_KICK set. */
+        if (flip_kick) {
+            static unsigned phantom_stuck;
+            uint32_t pend  = BRIDGE_MEM32(0x0014582Cu);      /* ctx+0xB4  pending */
+            uint32_t q0    = BRIDGE_MEM32(0x001458ECu);      /* ctx+0x174 flip buf0 */
+            uint32_t q1    = BRIDGE_MEM32(0x001458F8u);      /* ctx+0x180 flip buf1 */
+            uint32_t scene = BRIDGE_MEM32(0x0051A0FCu) & 0x7Fu;
+            if (pend == 1 && q0 == 0 && q1 == 0 && scene == 0) {
+                if (++phantom_stuck >= 30) {                 /* ~0.5s sustained */
+                    BRIDGE_MEM32(0x0014582Cu) = 0;           /* clear ctx+0xB4      */
+                    BRIDGE_MEM32(0xFD000140u) = 0;           /* clear the mirror    */
+                    fprintf(stderr, "  [FLIPKICK] cleared phantom present-pending"
+                            " (ctx+0xB4, device+0x140) after %u vblanks; heartbeat"
+                            " decoupled\n", phantom_stuck);
+                    fflush(stderr);
+                    phantom_stuck = 0;
+                }
+            } else {
+                phantom_stuck = 0;
+            }
+        }
+
+        /* Steady-state vblank health (RECOMP_VBLANK_DEBUG). The scene frame
+         * throttle (sub_000A35D0 @0xAFC45) resets the frame counter [0x51A0A0]=0
+         * each frame and busy-waits for it to reach 1; only the swap callback
+         * sub_000A4930 (registered at device+0x1DA8, driven by this ISR's
+         * accepted-flip -> DPC chain) advances it. On device the intro renders
+         * ~0.11fps, so that heartbeat fires ~once/8.6s instead of ~60Hz. This
+         * splits the cause without guessing: ISR invoked ~60Hz but rarely CLAIMS
+         * -> its accept gate ([ctx+0xA0] && [*ctx+0x140]) is the block; claims
+         * ~60Hz but [0x51A0A0] stays flat -> the flip->swap-callback dispatch is;
+         * claims rarely -> present isn't requesting flips (the throttle starves
+         * it, an ordering problem). */
+        if (getenv("RECOMP_VBLANK_DEBUG")) {
+            n_inv++;
+            if (claimed > 0) n_claim++;
+            else if (claimed == 0) n_decl++;
+            if (now - last_report >= 2000) {
+                fprintf(stderr, "  [VBLANK] 2s: invoked=%u claimed=%u declined=%u | frame-ctr [0x51A0A0]=%u\n",
+                        n_inv, n_claim, n_decl, (unsigned)BRIDGE_MEM32(0x0051A0A0u));
+                fflush(stderr);
+                n_inv = n_claim = n_decl = 0;
+                last_report = now;
+            }
+        }
     }
+}
+
+/* The NV2A's command/flip-completion interrupt, delivered to the handler a title
+ * connects for the GPU proper -- separate from the PCRTC vblank above.
+ *
+ * A title's D3D8 that gates the next frame on GPU completion installs an ISR
+ * that reads a software interrupt-status word (pending & enabled) from a block
+ * its device points at, does its swap/flip bookkeeping and queues a DPC that
+ * signals the frame done. Nothing here ever raises it, so after the pushbuffer
+ * drains the title still waits forever for "the flip happened". Blinx connects
+ * exactly this on vector 1 (KeConnectInterrupt: vector 1 -> 0x001970E0): the ISR
+ * claims only when pending has its master bit (0x80000000) and a source bit set,
+ * so those have to be written before the routine is called, the same way the
+ * vblank tick primes PCRTC/PMC above.
+ *
+ * The handler claims only when its status word has the master bit (0x80000000)
+ * AND a source bit that is also in its enable mask -- so priming a fixed source
+ * bit fails whenever the title enabled different ones. Instead read the enable
+ * mask the title itself set (block + en_off) and OR the master bit onto exactly
+ * those: (pending |= enabled | master) guarantees both conditions for whatever
+ * the title enabled, so the ISR claims, runs its swap/flip and queues its DPC.
+ *
+ * Env-driven because the offsets are title-specific and best tuned live:
+ *   RECOMP_GPU_IRQ                          enable; defaults vector 1, pend +0x10,
+ *                                           enable +0x0C, no extra forced bits
+ *   RECOMP_GPU_IRQ=<vec>:<pendOff>:<enOff>:<extraBits>   override (hex)
+ * The context the ISR receives is the KINTERRUPT's own (kint+4); the status
+ * block is the pointer that context holds, matching block = *(esi). */
+static void kernel_gpu_irq_tick(void)
+{
+    static int   enabled = -1;
+    static uint32_t vec = 1, pend_off = 0x10, en_off = 0x0C, extra = 0;
+    static long long next_ms;
+    long long now;
+    uint32_t kint, context, block, en_mask, set, pend;
+
+    if (enabled < 0) {
+        const char *s = getenv("RECOMP_GPU_IRQ");
+        enabled = s != NULL;
+        if (s && strchr(s, ':')) {
+            const char *c1 = strchr(s, ':');
+            const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+            const char *c3 = c2 ? strchr(c2 + 1, ':') : NULL;
+            vec      = (uint32_t)strtoul(s, NULL, 0);
+            pend_off = (uint32_t)strtoul(c1 + 1, NULL, 0);
+            en_off   = c2 ? (uint32_t)strtoul(c2 + 1, NULL, 0) : en_off;
+            extra    = c3 ? (uint32_t)strtoul(c3 + 1, NULL, 0) : 0;
+        }
+        if (enabled)
+            fprintf(stderr, "  [NV2A] GPU IRQ delivery: vector %u, pending +0x%X"
+                    " |= (enable +0x%X | 0x80000000 | 0x%08X) @ ~60 Hz\n",
+                    vec, pend_off, en_off, extra);
+    }
+    if (!enabled)
+        return;
+
+    now = (long long)GetTickCount64();
+    if (now < next_ms)
+        return;
+    next_ms = now + 16;                       /* ~60 Hz */
+
+    kint = xbox_GetConnectedInterrupt(vec);
+    if (!kint)
+        return;
+    context = BRIDGE_MEM32(kint + 4);         /* the ISR's ServiceContext */
+    if (!context)
+        return;
+    block = BRIDGE_MEM32(context);            /* block = *(esi): the status block */
+    if (!block)
+        return;
+
+    /* Prime the master bit plus whatever the title has enabled, then deliver. */
+    en_mask = BRIDGE_MEM32(block + en_off);
+    set     = en_mask | 0x80000000u | extra;
+    BRIDGE_MEM32(block + pend_off) |= set;
+    pend    = BRIDGE_MEM32(block + pend_off);
+    {
+        static unsigned n;
+        int claimed = kernel_raise_interrupt(vec);
+        if (n++ < 8)
+            fprintf(stderr, "  [NV2A] GPU IRQ: block=0x%08X enable=0x%08X "
+                    "pending=0x%08X -> ISR %s\n", block, en_mask, pend,
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
+/* Opt-in memory watcher: RECOMP_MEMWATCH="0xBASE:NDWORDS" dumps the dwords in
+ * [BASE, BASE+NDWORDS*4) once a second, printing only those that changed since
+ * the last tick. Used to find an in-memory swap/vblank counter the guest polls
+ * (and to see whether anything advances it). Inert unless the env var is set. */
+static void memwatch_tick(void)
+{
+    static int inited = 0;
+    static uint32_t base = 0;
+    static int ndw = 0;
+    static uint32_t prev[256];
+    static long long next_ms = 0;
+    long long now;
+    int i;
+
+    if (!inited) {
+        const char *e = getenv("RECOMP_MEMWATCH");
+        inited = 1;
+        if (e && *e) {
+            const char *c = strchr(e, ':');
+            base = (uint32_t)strtoul(e, NULL, 0);
+            ndw = c ? atoi(c + 1) : 64;
+            if (ndw < 1) ndw = 1;
+            if (ndw > 256) ndw = 256;
+            for (i = 0; i < ndw; i++)
+                prev[i] = 0xDEADBEEFu;
+        }
+    }
+    if (!base)
+        return;
+
+    now = (long long)GetTickCount64();
+    if (now < next_ms)
+        return;
+    next_ms = now + 1000;
+
+    for (i = 0; i < ndw; i++) {
+        uint32_t v = BRIDGE_MEM32(base + (uint32_t)i * 4);
+        if (v != prev[i]) {
+            fprintf(stderr, "  [MEMWATCH] 0x%08X = 0x%08X (was 0x%08X)\n",
+                    base + (uint32_t)i * 4, v, prev[i]);
+            prev[i] = v;
+        }
+    }
+    fflush(stderr);
+}
+
+/* Opt-in one-shot stack scanner: RECOMP_STACKSCAN=<seconds> scans the guest
+ * stack region for .text-range dwords (return addresses) once, after the given
+ * delay. The game loop runs on a worker thread whose g_esp is thread-local and
+ * not reachable from here, so scanning the whole stack region surfaces every
+ * live thread's call chain at the moment of the hang. */
+static void stackscan_tick(void)
+{
+    static int inited = 0, secs = 0, done = 0;
+    static long long due = 0;
+    uint32_t a, printed = 0;
+
+    if (!inited) {
+        const char *e = getenv("RECOMP_STACKSCAN");
+        inited = 1;
+        secs = e ? atoi(e) : 0;
+        if (secs > 0)
+            due = (long long)GetTickCount64() + (long long)secs * 1000;
+    }
+    if (secs <= 0 || done)
+        return;
+    if ((long long)GetTickCount64() < due)
+        return;
+    done = 1;
+
+    fprintf(stderr, "[STACKSCAN] guest-stack .text-range return addrs "
+                    "(0x00780000..0x00F80000):\n");
+    for (a = 0x00780000u; a < 0x00F80000u && printed < 600; a += 4) {
+        uint32_t v = BRIDGE_MEM32(a);
+        if (v >= 0x00012000u && v < 0x00400000u) {
+            fprintf(stderr, "  SS %08X = %08X\n", a, v);
+            printed++;
+        }
+    }
+    fprintf(stderr, "[STACKSCAN] done (%u addrs)\n", printed);
+    fflush(stderr);
+}
+
+/* Opt-in one-shot PC sampler (Windows oracle only): RECOMP_PCSAMPLE=<seconds>
+ * suspends each other thread once after the delay, grabs its RIP + a slice of
+ * stack, resumes it, then symbolizes -- naming the exact recomp function a hung
+ * guest thread is spinning in (sub_XXXXXXXX+off) plus its call chain. This is
+ * the definitive "where is the main thread stuck" probe. Inert unless set. */
+#ifdef _WIN32
+#include <tlhelp32.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+static void pcsample_tick(void)
+{
+    static int inited = 0, secs = 0, done = 0;
+    static long long due = 0;
+    DWORD myproc, mytid;
+    HANDLE snap;
+    struct pcs_cap { DWORD tid; DWORD64 rip; DWORD64 stk[48]; int nstk; } caps[24];
+    int ncap = 0, t, i;
+    char sbuf[sizeof(SYMBOL_INFO) + 320];
+    SYMBOL_INFO *si = (SYMBOL_INFO *)sbuf;
+
+    if (!inited) {
+        const char *e = getenv("RECOMP_PCSAMPLE");
+        inited = 1;
+        secs = e ? atoi(e) : 0;
+        if (secs > 0)
+            due = (long long)GetTickCount64() + (long long)secs * 1000;
+    }
+    if (secs <= 0 || done)
+        return;
+    if ((long long)GetTickCount64() < due)
+        return;
+    done = 1;
+
+    myproc = GetCurrentProcessId();
+    mytid = GetCurrentThreadId();
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te;
+        te.dwSize = sizeof te;
+        if (Thread32First(snap, &te)) {
+            do {
+                HANDLE th;
+                if (te.th32OwnerProcessID != myproc || te.th32ThreadID == mytid)
+                    continue;
+                if (ncap >= 24)
+                    break;
+                th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                FALSE, te.th32ThreadID);
+                if (!th)
+                    continue;
+                if (SuspendThread(th) != (DWORD)-1) {
+                    CONTEXT ctx;
+                    memset(&ctx, 0, sizeof ctx);
+                    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                    if (GetThreadContext(th, &ctx)) {
+                        struct pcs_cap *c = &caps[ncap++];
+                        SIZE_T got = 0;
+                        c->tid = te.th32ThreadID;
+                        c->rip = ctx.Rip;
+                        ReadProcessMemory(GetCurrentProcess(),
+                                          (void *)(uintptr_t)ctx.Rsp,
+                                          c->stk, sizeof c->stk, &got);
+                        c->nstk = (int)(got / sizeof(DWORD64));
+                    }
+                    ResumeThread(th);
+                }
+                CloseHandle(th);
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+    }
+
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    for (t = 0; t < ncap; t++) {
+        struct pcs_cap *c = &caps[t];
+        DWORD64 disp = 0;
+        int printed = 0;
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 300;
+        if (SymFromAddr(GetCurrentProcess(), c->rip, &disp, si))
+            fprintf(stderr, "[PCSAMPLE] tid=%lu rip -> %s+0x%llX\n",
+                    (unsigned long)c->tid, si->Name, (unsigned long long)disp);
+        else
+            fprintf(stderr, "[PCSAMPLE] tid=%lu rip=%016llX (no sym)\n",
+                    (unsigned long)c->tid, (unsigned long long)c->rip);
+        for (i = 0; i < c->nstk && printed < 10; i++) {
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 300;
+            disp = 0;
+            if (SymFromAddr(GetCurrentProcess(), c->stk[i], &disp, si)
+                && strncmp(si->Name, "sub_", 4) == 0 && disp < 0x8000) {
+                fprintf(stderr, "    <- %s+0x%llX\n",
+                        si->Name, (unsigned long long)disp);
+                printed++;
+            }
+        }
+    }
+    fflush(stderr);
+}
+#else
+static void pcsample_tick(void) { }
+#endif
+
+/* Opt-in GPU-idle reflection (RECOMP_GPU_IDLE): our executor drains the
+ * pushbuffer synchronously, so the NV2A is always idle from the guest's view --
+ * but D3D8 polls the hardware idle indicators, which our aperture (plain RAM)
+ * never updates. Reflect idle each tick: PFIFO DMA_GET catches up to DMA_PUT,
+ * PGRAPH reports not-busy, and the PFB cache-pull/flush bit is acked. This
+ * clears the "wait for GPU idle" spins (sub_00139240 flush, sub_00136D20
+ * DMA_GET==DMA_PUT + PGRAPH_STATUS). A confirmation harness for the real fix,
+ * which belongs in the executor after each drain. */
+static void gpu_idle_tick(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_GPU_IDLE") != NULL;
+    if (!on)
+        return;
+    /* PFIFO CACHE1: DMA_GET (0x3244) catches up to DMA_PUT (0x3240). */
+    BRIDGE_MEM32(0xFD003244u) = BRIDGE_MEM32(0xFD003240u);
+    /* PGRAPH_STATUS (0x400700): 0 = idle. */
+    BRIDGE_MEM32(0xFD400700u) = 0;
+    /* PFB flush/cache-pull kick (0x100410 bit 0x10000): ack by clearing. */
+    BRIDGE_MEM32(0xFD100410u) &= ~0x00010000u;
+    /* PGRAPH object/position tracker (0x400B10): sub_00139120 spins until its
+     * low 5 bits match the pushbuffer GET count. Reflect the drained count. */
+    BRIDGE_MEM32(0xFD400B10u) = BRIDGE_MEM32(0x00143B8Cu);
 }
 
 /* Run whatever is queued. Called from the timer thread, which has the guest
@@ -2013,7 +2796,19 @@ static void kernel_drain_dpcs(void)
         LONG head = g_dpc_head;
         PendingDpc d = g_dpc_queue[head];
         g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
-        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+        if (g_timer_profile > 0) {
+            uint32_t routine = BRIDGE_MEM32(d.dpc + 12);
+            long long t = (long long)GetTickCount64();
+            kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+            t = (long long)GetTickCount64() - t;
+            if (t >= g_timer_slow_ms) {
+                fprintf(stderr, "  [TMRPROF] queued DPC 0x%08X routine=0x%08X took %lldms\n",
+                        d.dpc, routine, t);
+                fflush(stderr);
+            }
+        } else {
+            kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+        }
     }
 }
 
@@ -2262,14 +3057,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    if (g_timer_profile < 0) {
+        const char *pe = getenv("RECOMP_TIMER_PROFILE");
+        g_timer_profile = pe ? 1 : 0;
+        if (pe && atoi(pe) > 0) g_timer_slow_ms = atoi(pe);
+    }
+
     for (;;) {
         long long now;
+        long long ts0, ts_vbl, ts_irq, ts_drain, ts_misc, ts_end;
         int i;
 
         Sleep(10);
+        ts0 = (long long)GetTickCount64();
         kernel_vblank_tick();  /* the GPU's frame clock */
+        ts_vbl = (long long)GetTickCount64();
+        kernel_gpu_irq_tick(); /* opt-in: NV2A command/flip-completion IRQ */
+        ts_irq = (long long)GetTickCount64();
         kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = (long long)GetTickCount64();
+        ts_drain = (long long)GetTickCount64();
+        memwatch_tick();       /* opt-in: watch a polled counter region */
+        stackscan_tick();      /* opt-in: one-shot guest-stack call-chain scan */
+        pcsample_tick();       /* opt-in: one-shot thread-context PC sampler */
+        gpu_idle_tick();       /* opt-in: reflect NV2A GPU-idle regs (test harness) */
+        ts_misc = (long long)GetTickCount64();
+        now = ts_misc;
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
@@ -2288,8 +3100,20 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             LeaveCriticalSection(&g_timer_lock);
 
             /* Outside the lock: the routine can set or cancel timers. */
-            if (dpc)
-                kernel_run_dpc(dpc, 0, 0);
+            if (dpc) {
+                if (g_timer_profile > 0) {
+                    long long td = (long long)GetTickCount64();
+                    kernel_run_dpc(dpc, 0, 0);
+                    td = (long long)GetTickCount64() - td;
+                    if (td >= g_timer_slow_ms) {
+                        fprintf(stderr, "  [TMRPROF] timer DPC 0x%08X routine=0x%08X took %lldms\n",
+                                dpc, BRIDGE_MEM32(dpc + 12), td);
+                        fflush(stderr);
+                    }
+                } else {
+                    kernel_run_dpc(dpc, 0, 0);
+                }
+            }
 
             /* Wake anyone parked on the timer's shadow event; a timer with no
              * DPC is just a kernel sleep. */
@@ -2300,6 +3124,20 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                     BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
                 }
             }
+        }
+
+        /* Cycle summary: if the frame clock stalled this iteration, name the
+         * step that ate it. vblank = the guest vblank ISR + its flip handler;
+         * drain = a queued (flip) DPC (its own [TMRPROF] line names the routine);
+         * timers = a due-timer DPC (likewise). If cycles keep completing fast
+         * during a device-observed stall, the frame clock is fine and the block
+         * is a present-side wait not being woken -- a different probe. */
+        ts_end = (long long)GetTickCount64();
+        if (g_timer_profile > 0 && (ts_end - ts0) >= g_timer_slow_ms) {
+            fprintf(stderr, "  [TMRPROF] slow cycle %lldms: vblank=%lld gpuirq=%lld drain=%lld misc=%lld timers=%lld\n",
+                    ts_end - ts0, ts_vbl - ts0, ts_irq - ts_vbl,
+                    ts_drain - ts_irq, ts_misc - ts_drain, ts_end - ts_misc);
+            fflush(stderr);
         }
     }
 }
@@ -2735,6 +3573,29 @@ static void bridge_NtCreateFile(void)
                   : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
         else
             fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
+        /* On a NOT-FOUND open, dump the guest return-address chain (top stack
+         * dwords) so we can trace up to the loop that iterated the (overrun)
+         * resource list and opened a garbage name. Bounded. RECOMP_SAVETRACE. */
+        if (g_eax && _e == 2u) {
+            static int who = -1;
+            if (who < 0) who = getenv("RECOMP_SAVETRACE") != NULL;
+            static int wn = 0;
+            if (who && wn < 24) { wn++;
+                /* Scan the guest stack for game-.text return addresses (VAs in
+                 * [0x12000,0x400000)) = the caller chain up to the loop that
+                 * iterated the (overrun) resource list. Same walk as [KERNEL]. */
+                uint32_t sp = g_esp; int i, shown = 0;
+                fprintf(stderr, "  [FILEWHO] .dds not-found; guest ret chain:");
+                for (i = 0; i < 200 && shown < 14; i++) {
+                    uint32_t w = BRIDGE_MEM32(sp + (uint32_t)(i * 4));
+                    if (w >= 0x00012000u && w < 0x00400000u) {
+                        fprintf(stderr, " %08X", w);
+                        shown++;
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+        }
     }
     fflush(stderr);
 }
@@ -3048,6 +3909,23 @@ static void bridge_NtQueryInformationFile(void)
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+
+    /* RECOMP_SAVETRACE: the save loader (sub_00084380) queries a file's size and
+     * sets the sub_00084150 dirty flag (0x9F5D5C=1) when size != 0x1770. Dump the
+     * size fields for size-class queries so we can see which file returns what. */
+    {
+        static int qt = -1;
+        if (qt < 0) qt = getenv("RECOMP_SAVETRACE") != NULL;
+        if (qt && (infoclass == 34u || infoclass == 5u)) {
+            static int qn = 0;
+            if (qn < 120) { qn++;
+                fprintf(stderr, "  [QUERY] class=%u d0=%08X d8=%08X d28=%08X st=0x%08X\n",
+                        infoclass, BRIDGE_MEM32(info_va + 0u), BRIDGE_MEM32(info_va + 8u),
+                        BRIDGE_MEM32(info_va + 0x28u), (uint32_t)ios.Status);
+                fflush(stderr);
+            }
+        }
+    }
 }
 
 /* ── NtSetInformationFile (ordinal 226, 5 args = 20 bytes) ─ */
@@ -3298,6 +4176,20 @@ static void bridge_NtDeviceIoControlFile(void)
         BRIDGE_MEM32(out_va + 24) = 0x00010106u;             /* type/boot/recog */
         BRIDGE_MEM32(out_va + 28) = 0;
         bridge_write_iostatus(ios_va, 0, 32);
+        g_eax = 0;
+        return;
+    }
+
+    /* Disc/media query IOCTLs on the DVD device (e.g. 0x4D014, the media-type/
+     * verify call Blinx issues at startup). We have no real optical hardware, so
+     * report success with a zeroed output buffer: the title is confirming the
+     * game disc is present and readable, and a NOT_SUPPORTED here makes it treat
+     * the media as invalid and reboot (XLaunchNewImage self, boot-loop). */
+    if ((ioctl >> 16) == 0x4 /* FILE_DEVICE_CD_ROM-family on Xbox */) {
+        if (out_va && out_len)
+            for (uint32_t i = 0; i + 4 <= out_len; i += 4) BRIDGE_MEM32(out_va + i) = 0;
+        bridge_write_iostatus(ios_va, 0, out_len);
+        fprintf(stderr, "  [FILE] NtDeviceIoControlFile(0x%X) - faked OK (disc query)\n", ioctl);
         g_eax = 0;
         return;
     }
@@ -3904,6 +4796,9 @@ static void bridge_KeWaitForMultipleObjects(void)
     for (i = 0; i < count; i++)
         handles[i] = bridge_resolve_handle(
             objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    for (i = 0; i < count && i < 4; i++)
+        ke_diag_log('M', objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0,
+                    handles[i]);
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
@@ -6373,6 +7268,7 @@ static void bridge_KePulseEvent(void)
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
+    ke_diag_log('P', guest_va, h);
     if (h)
         PulseEvent(h);
 
@@ -6395,6 +7291,7 @@ static void bridge_KeReleaseMutant(void)
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
+    ke_diag_log('U', guest_va, h);
     if (h)
         ReleaseMutex(h);
 
@@ -6416,6 +7313,7 @@ static void bridge_KeReleaseSemaphore(void)
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
+    ke_diag_log('R', guest_va, h);
     if (h)
         ReleaseSemaphore(h, (LONG)adjustment, NULL);
 
@@ -6433,6 +7331,8 @@ static void bridge_KeResetEvent(void)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
         ResetEvent(h);
+    if (guest_va)
+        BRIDGE_MEM32(guest_va + 4) = 0;   /* clear guest SignalState (see KeSetEvent) */
 
     g_eax = 0;
 }
@@ -6663,6 +7563,7 @@ static void bridge_KeSetEventBoostPriority(void)
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
+    ke_diag_log('B', guest_va, h);
     if (h)
         SetEvent(h);
 
@@ -6956,18 +7857,70 @@ static void bridge_NtQueryTimer(void)
     g_eax = 0;
 }
 
-/* --- NtReadFileScatter (ordinal 220, 8 args = 32 bytes) --- */
+/* --- NtReadFileScatter (ordinal 220, 8 args = 32 bytes) ---
+ * Scatter/gather read: SegmentArray (arg5) is a NULL-terminated list of 8-byte
+ * FILE_SEGMENT_ELEMENTs, each pointing at ONE page (4096 bytes). `Length` (arg6)
+ * total bytes are read from the file at ByteOffset (arg7), one page per element.
+ * This was previously a no-op stub that returned STATUS_SUCCESS having read
+ * NOTHING -- so any save/level data a title streamed via scatter stayed zero,
+ * which passed a magic check on a separately-read header but failed the record
+ * checksum. Implement it for real by delegating each page to xbox_NtReadFile. */
 static void bridge_NtReadFileScatter(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t iostatus  = STACK_ARG(4);
+    uint32_t seg_va    = STACK_ARG(5);
+    uint32_t length    = STACK_ARG(6);
+    uint32_t offset_va = STACK_ARG(7);
+    const uint32_t PAGE = 4096;
+    LARGE_INTEGER base = {0};
+    int have_off = 0;
+    uint32_t total = 0;
+    NTSTATUS st = 0; /* STATUS_SUCCESS */
+    uint32_t seg_count = 0;
+
+    if (offset_va) {
+        base.LowPart  = BRIDGE_MEM32(offset_va);
+        base.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
+        have_off = 1;
+    }
+
+    while (total < length) {
+        uint32_t page_va = BRIDGE_MEM32(seg_va + seg_count * 8u);
+        if (page_va == 0) break;              /* NULL-terminated segment list */
+        uint32_t want = length - total;
+        if (want > PAGE) want = PAGE;         /* one page per element */
+
+        XBOX_IO_STATUS_BLOCK pios;
+        LARGE_INTEGER poff;
+        memset(&pios, 0, sizeof(pios));
+        poff.QuadPart = base.QuadPart + (LONGLONG)total;
+        st = (NTSTATUS)xbox_NtReadFile(handle, NULL, NULL, NULL, &pios,
+                 XBOX_TO_NATIVE(page_va), want, have_off ? &poff : NULL);
+        uint32_t got = (uint32_t)pios.Information;
+        total += got;
+        seg_count++;
+        if (st != 0 || got < want) break;     /* error or EOF: stop */
+    }
+
+    /* Report SUCCESS if we delivered any data; only surface an error when the
+     * very first page failed with nothing read. */
+    if (total > 0) st = 0;
+
+    {
+        static int logged = 0;
+        if (logged < 16) {
+            logged++;
+            fprintf(stderr, "  [SCATTER] NtReadFileScatter segs=%u want=%u got=%u off=%lld st=0x%08X\n",
+                    seg_count, length, total,
+                    have_off ? (long long)base.QuadPart : -1, (uint32_t)st);
+            fflush(stderr);
+        }
+    }
+
+    g_eax = (uint32_t)st;
+    bridge_write_iostatus(iostatus, st, total);
+    bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3), iostatus);
 }
 
 /* --- NtRemoveIoCompletion (ordinal 223, 5 args = 20 bytes) --- */
@@ -8703,6 +9656,22 @@ static void kernel_thunk_dispatch(void)
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
+            /* Walk the guest stack for return addresses in the game's .text so a
+             * stalled title's HIGH-LEVEL loop is named, not just the innermost
+             * heap callee the per-call ret= shows. Guest code VAs land roughly
+             * in [0x00012000, 0x00400000) for this title's image. */
+            if (g_esp) {
+                uint32_t sp = g_esp; int i, shown = 0;
+                fprintf(stderr, "  [KERNEL]   guest call chain:");
+                for (i = 0; i < 160 && shown < 14; i++) {
+                    uint32_t w = BRIDGE_MEM32(sp + (uint32_t)(i * 4));
+                    if (w >= 0x00012000u && w < 0x00400000u) {
+                        fprintf(stderr, " 0x%08X", w);
+                        shown++;
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
              * title sitting still is actually asking the kernel for, and
