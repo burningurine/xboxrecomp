@@ -945,6 +945,11 @@ static void gpu_idle_reflect_tick(void)
  * waiter is a busy guest thread anyway. */
 static volatile LONG s_drain_lock;
 static uint32_t s_drain_last_put;
+/* Bumped before each drained segment. Guest threads do not run while their
+ * own kick drains, so within one generation guest memory is (as far as the
+ * renderer is concerned) unchanged: the renderer's content-hash dirty check
+ * hashes a page once per generation (renderer/xemu-nv2a glue). */
+volatile uint32_t g_nv2a_drain_gen = 1;
 static DWORD    s_drain_last_ms;
 
 static void drain_lock(void)
@@ -977,6 +982,7 @@ static int nv2a_drain_locked(volatile uint32_t *regs, DWORD now_ms)
          * the contiguous window is the physical view, so OR its base back.
          * put < last is a ring wrap; the drain follows the JUMP. */
         if (s_drain_last_put && put != s_drain_last_put) {
+            g_nv2a_drain_gen++;
             nv2a_pb_drain(XBOX_CONTIG_BASE | (s_drain_last_put & 0x0FFFFFFFu),
                           XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu),
                           XBOX_CONTIG_BASE);

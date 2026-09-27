@@ -421,6 +421,11 @@ static void note_unhandled(uint32_t method, uint32_t param)
 {
     int i;
 
+    /* With a renderer backend the method was already handed over; the
+     * inventory only serves the CPU raster's bring-up (7% of the game thread
+     * on the RP6 at scene 9 -- a linear search per method). */
+    if (s_backend)
+        return;
     s_gpu.unhandled_total++;
     for (i = 0; i < s_unhandled_count; i++) {
         if (s_unhandled[i].method == method) {

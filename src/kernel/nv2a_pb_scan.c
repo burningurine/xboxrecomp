@@ -185,7 +185,8 @@ static void pb_scan_core(uint32_t start_va, uint32_t end_va, uint32_t *jump_off)
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                if (s_scan)
+                    note(subch, m);   /* inventory only when surveying */
                 /* Bounded method+arg trace (RECOMP_PB_METHOD_TRACE) to capture
                  * the exact push-buffer method sequence for GPU bring-up. Off by
                  * default; stops after a cap so it never floods a long run. */
