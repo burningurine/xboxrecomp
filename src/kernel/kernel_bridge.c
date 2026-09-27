@@ -1479,83 +1479,213 @@ static void ke_diag_log(char tag, uint32_t va, HANDLE h)
     }
 }
 
-/* ── Lazy-backing for unbacked guest KEVENTs (env-gated: RECOMP_KE_LAZYBACK) ──
+/* ── Guest-memory events: KEVENTs the kernel never initialised ──────────────
  *
- * A guest KEVENT never passed to KeInitializeEvent has no ke_shadow entry, so a
- * wait on it takes the non-blocking STATUS_SUCCESS path (which busy-spins the
- * caller at 100% CPU) and a KeSetEvent on it only writes the SignalState mirror.
- * When enabled, the first wait/set on such an event lazily creates a real host
- * event, keyed by the guest VA in ke_shadow, so the wait BLOCKS and the set
- * WAKES it -- converting the spin into a real block+wake.
+ * Blinx never calls KeInitializeEvent. D3D, the CRI sound/stream manager and
+ * the XPP USB stack all build their KEVENTs inline (D3D's vertical-blank event
+ * at device+0x1DAC is three byte stores in sub_0013E914), so none of them has a
+ * ke_shadow host event. Their state lives where the title keeps it: the
+ * DISPATCHER_HEADER in guest memory, Type at +0 (0 notification, 1
+ * synchronization) and SignalState at +4. That is also where the title itself
+ * changes it -- D3D's BlockUntilVerticalBlank (sub_00135FA0) clears
+ * SignalState with a plain store and then waits.
  *
- * The wait is bounded (RECOMP_KE_LAZYBACK_MS, default 100 ms): a real SetEvent
- * wakes it at once, but if the "producer" is something we never deliver (a
- * DPC/ISR), the wait degrades to today's rate-limited poll rather than a hard
- * deadlock -- strictly better than a 100%-CPU spin, never worse than now.
+ * So a wait reads the header in guest memory and sleeps on one host condition
+ * variable; KeSetEvent writes SignalState there and wakes every sleeper, and
+ * each re-checks its own object. A satisfied wait on a synchronization event
+ * consumes it (SignalState back to 0), under the same lock, so a set releases
+ * exactly one waiter. Nothing is mirrored, so nothing can go stale.
  *
- * OFF by default: an A/B toggle to confirm the pool-wakeup-spin hypothesis on
- * device without touching the default path. */
-static int ke_lazyback_on(void)
-{
-    static int on = -1;
-    if (on < 0) on = getenv("RECOMP_KE_LAZYBACK") != NULL;
-    return on;
-}
+ * Only objects with a known producer block: a VA the title has passed to
+ * KeSetEvent (or KePulseEvent) at least once. Every other unbacked wait keeps
+ * the old answer, "already signalled". That is deliberate. An event whose
+ * producer this runtime never runs -- a DPC for an interrupt nothing raises --
+ * used to spin its waiter; blocking it would hang it instead. Once the title
+ * has shown a producer exists, the wait is the real one.
+ *
+ * RECOMP_KE_GUEST_WAIT=strict blocks on every unbacked event, =off restores the
+ * old non-blocking behaviour for all of them. A wait that stays blocked for more
+ * than 2 s logs once per object, naming it, so a missing producer is visible
+ * rather than a silent hang. */
+#define GEV_MAX_KNOWN 256
+static struct { uint32_t va; uint32_t pulses; } g_gev_known[GEV_MAX_KNOWN];
+static unsigned            g_gev_nknown;
+static CRITICAL_SECTION    g_gev_cs;
+static CONDITION_VARIABLE  g_gev_cv;
+static volatile LONG       g_gev_ready;     /* 0 = not yet, 1 = initialising, 2 = ready */
 
-static DWORD ke_lazyback_ms(void)
+static void gev_init(void)
 {
-    static DWORD ms = 0;
-    if (ms == 0) {
-        const char *s = getenv("RECOMP_KE_LAZYBACK_MS");
-        long v = s ? strtol(s, NULL, 0) : 0;
-        ms = (v > 0 && v <= 5000) ? (DWORD)v : 100;
+    if (g_gev_ready == 2)
+        return;
+    if (InterlockedCompareExchange(&g_gev_ready, 1, 0) == 0) {
+        InitializeCriticalSection(&g_gev_cs);
+        InitializeConditionVariable(&g_gev_cv);
+        InterlockedExchange(&g_gev_ready, 2);
+        return;
     }
-    return ms;
+    while (g_gev_ready != 2)
+        Sleep(0);
 }
 
-/* Get (creating on first touch) the host event backing an unbacked guest KEVENT.
- * Honors the dispatcher Type byte: 1 = Synchronization (auto-reset), else
- * Notification (manual-reset). Seeds the host state from the guest SignalState
- * mirror so a set that landed before the backing existed is not lost. */
-/* Guest KEVENTs that got their host event from lazy-backing. Only these are
- * signalled exclusively through KeSetEvent (which mirrors SignalState), so
- * only for these is a cleared guest SignalState a reliable "reset". */
-#define KE_MAX_LAZY 64
-static uint32_t g_ke_lazy[KE_MAX_LAZY];
-static volatile LONG g_ke_lazy_n;
-static void ke_lazy_note(uint32_t va)
+/* 0 = off, 1 = block on objects with a known producer (default), 2 = strict. */
+static int gev_mode(void)
 {
-    LONG i = InterlockedIncrement(&g_ke_lazy_n) - 1;
-    if (i < KE_MAX_LAZY) g_ke_lazy[i] = va;
-}
-static int ke_is_lazy(uint32_t va)
-{
-    LONG n = g_ke_lazy_n, i;
-    if (n > KE_MAX_LAZY) n = KE_MAX_LAZY;
-    for (i = 0; i < n; i++)
-        if (g_ke_lazy[i] == va) return 1;
-    return 0;
+    static int mode = -1;
+    if (mode < 0) {
+        const char *s = getenv("RECOMP_KE_GUEST_WAIT");
+        mode = !s ? 1 : !strcmp(s, "off") ? 0 : !strcmp(s, "strict") ? 2 : 1;
+    }
+    return mode;
 }
 
-static HANDLE ke_lazyback_get(uint32_t guest_va)
+/* Index of va in the known-producer table, or -1. Caller holds g_gev_cs. */
+static int gev_find_locked(uint32_t va)
 {
-    HANDLE h;
-    if (!guest_va)
-        return NULL;
-    h = ke_shadow_lookup(guest_va);
-    if (h)
-        return h;
-    {
-        uint8_t  type = (uint8_t)BRIDGE_MEM8(guest_va + 0);
-        uint32_t sig  = BRIDGE_MEM32(guest_va + 4);
-        BOOL     manual = (type == 1) ? FALSE : TRUE;
-        h = CreateEventW(NULL, manual, sig ? TRUE : FALSE, NULL);
-        if (h) {
-            ke_shadow_insert(guest_va, h);
-            ke_lazy_note(guest_va);
+    unsigned i;
+    for (i = 0; i < g_gev_nknown; i++)
+        if (g_gev_known[i].va == va)
+            return (int)i;
+    return -1;
+}
+
+static int gev_note_locked(uint32_t va)
+{
+    int i = gev_find_locked(va);
+    if (i >= 0)
+        return i;
+    if (g_gev_nknown >= GEV_MAX_KNOWN)
+        return -1;                      /* full: that object stays non-blocking */
+    g_gev_known[g_gev_nknown].va = va;
+    g_gev_known[g_gev_nknown].pulses = 0;
+    return (int)g_gev_nknown++;
+}
+
+/* PLARGE_INTEGER timeout in guest memory -> milliseconds. NULL is forever,
+ * negative is relative (100 ns units), zero is a poll. A positive (absolute
+ * system time) timeout is rare enough to be treated as a poll. */
+static DWORD gev_timeout_ms(uint32_t timeout_va)
+{
+    int64_t t;
+    if (!timeout_va)
+        return INFINITE;
+    t = (int64_t)(((uint64_t)BRIDGE_MEM32(timeout_va + 4) << 32) |
+                  BRIDGE_MEM32(timeout_va));
+    if (t >= 0)
+        return 0;
+    t = (-t + 9999) / 10000;
+    return t >= (int64_t)INFINITE ? INFINITE - 1 : (DWORD)t;
+}
+
+/* Wait on an unbacked guest KEVENT. Returns 1 with *status set when it handled
+ * the wait, 0 when the caller should keep the legacy "already signalled". */
+static int gev_wait(uint32_t object, uint32_t timeout_va, uint32_t *status)
+{
+    int mode = gev_mode(), known;
+    uint32_t pulses0 = 0;
+    DWORD budget;
+    ULONGLONG start, logged_at = 0;
+
+    if (!object || mode == 0 || BRIDGE_MEM8(object) > 1)
+        return 0;
+    gev_init();
+    budget = gev_timeout_ms(timeout_va);
+    start = GetTickCount64();
+
+    EnterCriticalSection(&g_gev_cs);
+    known = gev_find_locked(object);
+    if (known < 0 && mode == 1) {
+        LeaveCriticalSection(&g_gev_cs);
+        return 0;
+    }
+    if (known >= 0)
+        pulses0 = g_gev_known[known].pulses;
+
+    for (;;) {
+        ULONGLONG waited;
+        DWORD slice;
+
+        if ((int32_t)BRIDGE_MEM32(object + 4) > 0) {
+            if (BRIDGE_MEM8(object) == 1)
+                BRIDGE_MEM32(object + 4) = 0;           /* consume */
+            *status = 0;                                /* STATUS_SUCCESS */
+            break;
+        }
+        known = gev_find_locked(object);
+        if (known >= 0 && g_gev_known[known].pulses != pulses0) {
+            *status = 0;                                /* released by a pulse */
+            break;
+        }
+        waited = GetTickCount64() - start;
+        if (budget != INFINITE && waited >= budget) {
+            *status = (uint32_t)STATUS_TIMEOUT;
+            break;
+        }
+        if (waited >= 2000 && !logged_at) {
+            logged_at = waited;
+            fprintf(stderr, "  [KEWAIT] blocked 2s on guest KEVENT 0x%08X (type %u,"
+                    " state %d) -- its producer is not running\n",
+                    object, BRIDGE_MEM8(object), (int32_t)BRIDGE_MEM32(object + 4));
+            fflush(stderr);
+        }
+        slice = 1000;
+        if (budget != INFINITE && budget - (DWORD)waited < slice)
+            slice = budget - (DWORD)waited;
+        SleepConditionVariableCS(&g_gev_cv, &g_gev_cs, slice);
+    }
+    LeaveCriticalSection(&g_gev_cs);
+    return 1;
+}
+
+/* Set / pulse / reset an unbacked guest KEVENT. Each returns the previous
+ * SignalState, which is what the kernel routines return. */
+static uint32_t gev_set(uint32_t va, int pulse)
+{
+    uint32_t prev;
+    int i;
+
+    gev_init();
+    EnterCriticalSection(&g_gev_cs);
+    prev = BRIDGE_MEM32(va + 4);
+    i = gev_note_locked(va);
+    if (pulse) {
+        /* Release whoever is waiting now, leave it non-signalled. */
+        if (i >= 0)
+            g_gev_known[i].pulses++;
+        BRIDGE_MEM32(va + 4) = 0;
+    } else {
+        BRIDGE_MEM32(va + 4) = 1;
+    }
+    WakeAllConditionVariable(&g_gev_cv);
+    LeaveCriticalSection(&g_gev_cs);
+    return prev;
+}
+
+static uint32_t gev_reset(uint32_t va)
+{
+    uint32_t prev;
+
+    gev_init();
+    EnterCriticalSection(&g_gev_cs);
+    prev = BRIDGE_MEM32(va + 4);
+    BRIDGE_MEM32(va + 4) = 0;
+    LeaveCriticalSection(&g_gev_cs);
+    return prev;
+}
+
+/* An object pointer with no host sync object behind it. */
+static int ke_unbacked(uint32_t guest_va, HANDLE *out)
+{
+    HANDLE h = ke_shadow_lookup(guest_va);
+    if (!h) {
+        h = bridge_resolve_handle(guest_va);
+        if (!h || h == (HANDLE)(uintptr_t)guest_va) {
+            if (out) *out = h;
+            return 1;
         }
     }
-    return h;
+    if (out) *out = h;
+    return 0;
 }
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
@@ -1569,21 +1699,15 @@ static void bridge_KeSetEvent(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h && ke_lazyback_on())
-        h = ke_lazyback_get(guest_va);   /* real host event so a later wait blocks+wakes */
-    if (!h)
-        h = bridge_resolve_handle(guest_va);
-    /* An untagged token comes back from bridge_resolve_handle as the RAW guest
-     * VA. That is only a usable host pointer when the guest memory base is low
-     * (the Windows host, offset ~0x10000, so the VA lands inside the mapped
-     * guest window); on Android's high base it is an unmapped low address and
-     * faults inside native SetEvent. A KEVENT here is a guest object POINTER,
-     * so translate it to its host mapping. */
-    if (h == (HANDLE)(uintptr_t)guest_va)
-        h = (HANDLE)XBOX_TO_NATIVE(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    if (!guest_va) {
+        g_eax = 0;
+        return;
+    }
+    if (ke_unbacked(guest_va, &h)) {
+        ke_diag_log('S', guest_va, h);
+        g_eax = gev_set(guest_va, 0);
+        return;
+    }
     ke_diag_log('S', guest_va, h);
     /* Reflect the signal into the guest KEVENT's SignalState field (+0x04) so
      * title code that POLLS Event->Header.SignalState (rather than calling a
@@ -1591,30 +1715,8 @@ static void bridge_KeSetEvent(void)
      * the guest dispatcher header stayed stale -- a worker->main "load done"
      * handshake that polls SignalState then never completes (the load-warp gate
      * seen on the RP6: files load in 3.3s, then the scene never transitions). */
-    if (guest_va)
-        BRIDGE_MEM32(guest_va + 4) = 1;
-    if (h)
-        g_eax = (uint32_t)SetEvent(h);
-    else
-        g_eax = 0;
-}
-
-/* A lazy-backed guest KEVENT can be reset without the kernel:
- * D3D's BlockUntilVerticalBlank clears Header.SignalState inline and then
- * waits. The host event never saw that, stayed signalled after the first
- * vblank, and every wait returned at once -- the vblank thread ran flat out.
- * Before a wait, a cleared guest SignalState is the truth; after a satisfied
- * wait on a synchronization event, the event is consumed on the guest side
- * too. Events only (type 0 notification, 1 synchronization). */
-static void ke_event_pre_wait(uint32_t object, HANDLE h)
-{
-    if (BRIDGE_MEM8(object) <= 1 && BRIDGE_MEM32(object + 4) == 0)
-        ResetEvent(h);
-}
-static void ke_event_post_wait(uint32_t object, uint32_t status)
-{
-    if (status == 0 && BRIDGE_MEM8(object) == 1)
-        BRIDGE_MEM32(object + 4) = 0;
+    BRIDGE_MEM32(guest_va + 4) = 1;
+    g_eax = (uint32_t)SetEvent(h);
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
@@ -1654,31 +1756,15 @@ static void bridge_KeWaitForSingleObject(void)
     if (!h) {
         HANDLE r = bridge_resolve_handle(object);
         /* An untagged token resolves to the raw guest VA: an UNBACKED guest
-         * dispatcher object (KEVENT etc.), not a real host sync object. Handing
-         * it to the native wait BLOCKS FOREVER on Android -- the POSIX shim
-         * reads the KEVENT bytes as a w32_object and cond-waits on something
-         * nothing signals (the matching KeSetEvent no-ops). On the low-based
-         * Windows oracle the native wait just rejects the bogus handle and
-         * returns at once, so the guest never actually waits on these. Mirror
-         * that -- do NOT block: report the unbacked object already-signaled
-         * (STATUS_SUCCESS) and return, exactly the non-blocking behaviour the
-         * zeromap backstop gave (zeroed object -> kind!=K_EVENT -> fast
-         * success) that reached 2016 draws. (Proper fix = real guest-KEVENT
-         * SignalState sync via ke_shadow-backed host events.) */
+         * dispatcher object, a KEVENT the title built itself. It must never
+         * reach the native wait -- the POSIX shim would read the KEVENT bytes
+         * as a w32_object and cond-wait on something nothing signals. The
+         * guest-memory wait above (gev_wait) is the real one; objects it does
+         * not take keep the old answer, already signalled. */
         if (!r || r == (HANDLE)(uintptr_t)object) {
             ke_diag_log('W', object, r);
-            if (ke_lazyback_on()) {
-                HANDLE lb = ke_lazyback_get(object);
-                if (lb) {
-                    /* Block until a real KeSetEvent wakes us, bounded so a wake
-                     * that never arrives degrades to today's poll, not a hang. */
-                    ke_event_pre_wait(object, lb);
-                    WaitForSingleObject(lb, ke_lazyback_ms());
-                    g_eax = 0x00000000u;   /* STATUS_SUCCESS (woken or timed out) */
-                    ke_event_post_wait(object, g_eax);
-                    return;
-                }
-            }
+            if (gev_wait(object, timeout_ptr, &g_eax))
+                return;
             g_eax = 0x00000000u;   /* STATUS_SUCCESS -- treat as signaled */
             return;
         }
@@ -1686,16 +1772,9 @@ static void bridge_KeWaitForSingleObject(void)
     }
     ke_diag_log('W', object, h);
 
-    {
-        int lazy = ke_is_lazy(object);
-        if (lazy)
-            ke_event_pre_wait(object, h);
-        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-            h, wait_reason, wait_mode,
-            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
-        if (lazy)
-            ke_event_post_wait(object, g_eax);
-    }
+    g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+        h, wait_reason, wait_mode,
+        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -7501,14 +7580,16 @@ static void bridge_KePulseEvent(void)
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
-    HANDLE h;
+    HANDLE h = NULL;
 
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    if (guest_va && ke_unbacked(guest_va, &h)) {
+        ke_diag_log('P', guest_va, h);
+        g_eax = gev_set(guest_va, 1);
+        return;
+    }
     ke_diag_log('P', guest_va, h);
     if (h)
         PulseEvent(h);
@@ -7565,11 +7646,13 @@ static void bridge_KeReleaseSemaphore(void)
 static void bridge_KeResetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);
-    HANDLE h;
+    HANDLE h = NULL;
 
+    if (guest_va && ke_unbacked(guest_va, NULL)) {
+        g_eax = gev_reset(guest_va);
+        return;
+    }
     h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
     if (h)
         ResetEvent(h);
     if (guest_va)
@@ -7797,16 +7880,21 @@ static void bridge_KeSetEventBoostPriority(void)
 {
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
-    HANDLE h;
+    HANDLE h = NULL;
 
     (void)increment;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
+    if (guest_va && ke_unbacked(guest_va, &h)) {
+        ke_diag_log('B', guest_va, h);
+        gev_set(guest_va, 0);
+        g_eax = 0;
+        return;
+    }
     ke_diag_log('B', guest_va, h);
-    if (h)
+    if (h) {
+        BRIDGE_MEM32(guest_va + 4) = 1;
         SetEvent(h);
+    }
 
     g_eax = 0;
 }
