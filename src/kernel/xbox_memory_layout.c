@@ -2924,6 +2924,16 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     if (!g_heap_rebased && g_xbox_image_hi) {
         g_heap_rebased = 1;
         uint32_t above = (g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu; /* 64 KB align */
+        /* ...and above the contiguous arena too. xbox_ContiguousAlloc hands out
+         * physical pages from the same image_hi upward (the 64 MB contiguous
+         * window mirrors low RAM), so a heap based at image_hi sat on top of the
+         * GPU's pushbuffers and framebuffers: DMA_PUT 0x031E1000 and the scan-out
+         * 0x03264000 were inside the heap. The game's CRT heap free list then
+         * got corrupted and sub_000F5EE6 (free-list insert) spun forever at
+         * scene 9. With the 128 MB map the physical layout is:
+         * [0, image_hi) image | [image_hi, 64 MB) contiguous | [64 MB, map) heap. */
+        if (XBOX_HEAP_TOP > XBOX_CONTIG_SIZE + (16u << 20) && above < XBOX_CONTIG_SIZE)
+            above = XBOX_CONTIG_SIZE;
         if (g_heap_next < above) {
             fprintf(stderr, "  [HEAP] rebase base 0x%08X -> 0x%08X (above image_hi=0x%08X, top=0x%08X)\n",
                     g_heap_next, above, g_xbox_image_hi, (uint32_t)XBOX_HEAP_TOP);
