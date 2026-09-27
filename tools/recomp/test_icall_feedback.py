@@ -103,8 +103,12 @@ def test_seeds_drops_unaligned_targets():
     with tempfile.TemporaryDirectory() as tmp:
         db = os.path.join(tmp, "targets.json")
         out = os.path.join(tmp, "seeds.json")
+        fns = os.path.join(tmp, "functions.json")   # isolate from the live
+        with open(fns, "w") as f:                   # disasm output, where
+            json.dump([], f)                        # 0x130EC0 is interior
         save_db(db, {0x001B5540: 2, 0x001D99BA: 2, 0x0024B5FB: 2, 0x00130EC0: 2})
-        assert main(["--db", db, "seeds", "--out", out, "--align", "16"]) == 0
+        assert main(["--db", db, "--functions", fns,
+                     "seeds", "--out", out, "--align", "16"]) == 0
         kept = load_db(out)
     assert sorted(kept) == [0x00130EC0, 0x001B5540], [hex(v) for v in kept]
 

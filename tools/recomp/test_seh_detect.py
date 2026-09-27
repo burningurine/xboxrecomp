@@ -93,9 +93,9 @@ def test_detects_both():
         e_va: _fn(e_va, len(SEH_EPILOG_BYTES)),
         d_va: _fn(d_va, len(DECOY_BYTES)),
     }
-    prolog, epilog = detect_seh_helpers(func_db, data)
-    assert prolog == p_va, hex(prolog or 0)
-    assert epilog == e_va, hex(epilog or 0)
+    prologs, epilogs = detect_seh_helpers(func_db, data)
+    assert prologs == {p_va}, [hex(v) for v in prologs]
+    assert epilogs == {e_va}, [hex(v) for v in epilogs]
     print("ok  detects_both")
 
 
@@ -104,17 +104,17 @@ def test_decoy_alone_is_not_a_prolog():
     _layout()
     d_va = BASE + 0x300
     data = _image([(RAW + 0x300, DECOY_BYTES)])
-    prolog, epilog = detect_seh_helpers({d_va: _fn(d_va, len(DECOY_BYTES))}, data)
-    assert prolog is None
-    assert epilog is None
+    prologs, epilogs = detect_seh_helpers({d_va: _fn(d_va, len(DECOY_BYTES))}, data)
+    assert not prologs
+    assert not epilogs
     print("ok  decoy_alone_is_not_a_prolog")
 
 
 def test_absent_helpers_are_not_an_error():
     """A title whose CRT does not use these must detect cleanly as None."""
     _layout()
-    prolog, epilog = detect_seh_helpers({}, b"")
-    assert prolog is None and epilog is None
+    prologs, epilogs = detect_seh_helpers({}, b"")
+    assert not prologs and not epilogs
     print("ok  absent_helpers_are_not_an_error")
 
 
@@ -126,8 +126,8 @@ def test_accepts_int_end_from_batch_translator():
     info = _fn(p_va, len(SEH_PROLOG_BYTES))
     info["end"] = p_va + len(SEH_PROLOG_BYTES)   # int, not hex string
     del info["size"]                             # force the end-based path
-    prolog, _ = detect_seh_helpers({p_va: info}, data)
-    assert prolog == p_va
+    prologs, _ = detect_seh_helpers({p_va: info}, data)
+    assert prologs == {p_va}
     print("ok  accepts_int_end_from_batch_translator")
 
 
@@ -137,8 +137,8 @@ def test_oversized_match_is_rejected():
     va = BASE + 0x100
     padded = SEH_PROLOG_BYTES + b"\x90" * 400
     data = _image([(RAW + 0x100, padded)])
-    prolog, _ = detect_seh_helpers({va: _fn(va, len(padded))}, data)
-    assert prolog is None
+    prologs, _ = detect_seh_helpers({va: _fn(va, len(padded))}, data)
+    assert not prologs
     print("ok  oversized_match_is_rejected")
 
 
@@ -146,9 +146,9 @@ def test_unmapped_address_is_skipped():
     """va_to_file_offset returns None outside every section; not a crash."""
     _layout()
     data = _image([(RAW + 0x100, SEH_PROLOG_BYTES)])
-    prolog, epilog = detect_seh_helpers(
+    prologs, epilogs = detect_seh_helpers(
         {0x7FFFFFFF: _fn(0x7FFFFFFF, len(SEH_PROLOG_BYTES))}, data)
-    assert prolog is None and epilog is None
+    assert not prologs and not epilogs
     print("ok  unmapped_address_is_skipped")
 
 
@@ -157,7 +157,8 @@ def test_missing_xbe_data_is_skipped():
     _layout()
     p_va = BASE + 0x100
     func_db = {p_va: _fn(p_va, len(SEH_PROLOG_BYTES))}
-    assert detect_seh_helpers(func_db, None) == (None, None)
+    prologs, epilogs = detect_seh_helpers(func_db, None)
+    assert not prologs and not epilogs
     print("ok  missing_xbe_data_is_skipped")
 
 
