@@ -86,5 +86,37 @@
  {
   "start": "0x000EA1C0",
   "note": "Indirect-call target observed on device (round-4, 2nd): scene-object state-machine vtable callback. Same class as 0x76640 -- static discovery mis-identified 0x000EA1A2-0x000EA1BF as a garbage fn sub_000EA1A2 (mov edi,edi + a jump-table of 0x000Exxxx ptrs + CC pad) and swallowed this real entry at 0xEA1C0. recomp_lookup(0xEA1C0) failed at scene 0x89. Machine-translated via `recomp -f 0xEA1C0` (has an internal jump table @0xEA310 + FPU) and placed in recomp_gap_workers3.c; regen with the seed to fold it into recomp_0003.c properly."
+ },
+ {
+  "start": "0x00108790",
+  "note": "Indirect-call target observed at runtime on the RP6 2026-09-27 ([ICALL] Failed to resolve); clean prologue, no owning function."
+ },
+ {
+  "start": "0x00038370",
+  "note": "Address-taken (data_imm) code, clean prologue, no owning function (coverage scan 2026-09-27)."
+ },
+ {
+  "start": "0x000B8A20",
+  "note": "Address-taken (data_imm) code, clean prologue, no owning function (coverage scan 2026-09-27)."
+ },
+ {
+  "start": "0x000B8C00",
+  "note": "Address-taken (data_imm) code, clean prologue, no owning function (coverage scan 2026-09-27)."
+ },
+ {
+  "start": "0x00107C20",
+  "note": "Address-taken (data_imm x5) code, clean prologue, no owning function (coverage scan 2026-09-27)."
+ },
+ {
+  "start": "0x0011B2C0",
+  "note": "Address-taken (data_imm) code, clean prologue, no owning function (coverage scan 2026-09-27)."
+ },
+ {
+  "start": "0x0011ED20",
+  "note": "Address-taken (data_imm) code, clean prologue, no owning function (coverage scan 2026-09-27)."
+ },
+ {
+  "start": "0x0018E1E0",
+  "note": "Address-taken (data_imm) code in XPP, clean prologue, no owning function (coverage scan 2026-09-27)."
  }
 ]

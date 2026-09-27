@@ -1441,6 +1441,8 @@ class BatchTranslator:
         # translated chunks.
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
+        wrapped = dict(getattr(self.translator.lifter, 'wrapped_functions', {}) or {})
+        defined |= set(wrapped.values())        # hand-written wrappers
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
@@ -1482,6 +1484,12 @@ class BatchTranslator:
             for addr in sorted(manual_decls):
                 header_lines.append(
                     f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
+
+        if wrapped:
+            header_lines.append("")
+            header_lines.append("/* Hand-written wrappers around generated bodies (sub_X -> sub_X_gen) */")
+            for addr in sorted(wrapped):
+                header_lines.append(f"void {wrapped[addr]}(void);  /* 0x{addr:08X} */")
 
         if unresolved:
             header_lines.append("")
@@ -1647,9 +1655,11 @@ class BatchTranslator:
         # _initterm and atexit. The header already declares them.
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
+        # A wrapped function dispatches to its wrapper, not the _gen body, so
+        # indirect calls are intercepted exactly like direct ones.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
-                                  for addr, name in manual_decls.items()],
+            [(addr, wrapped.get(addr, name), code) for addr, name, code in translations]
+            + [(addr, name, None) for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)
