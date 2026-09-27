@@ -116,9 +116,30 @@ def _fixup_icall_esp_save(lines):
     if not icall_indices:
         return lines  # nothing to do
 
+    def _caller_cleans(icall_idx):
+        """True when the call returns to `esp = esp + N` (a cdecl caller
+        popping the arguments itself). A failed call must then undo only its
+        return address, like the callee's plain `ret` -- rewinding over the
+        arguments too made the caller pop them a second time, leaving esp
+        high by the argument size (Blinx sub_000E8160: an unresolved UI
+        callback shifted esp +4, the /GS cookie was read one slot off and the
+        epilogue restored callee-saved registers from the wrong slots)."""
+        k = icall_idx + 1
+        while k < len(lines):
+            s = lines[k].strip()
+            if not s or s == '}' or s.startswith('} ') or re.match(
+                    r'^loc_[0-9A-Fa-f]+:\s*;?$', s):
+                k += 1
+                continue
+            return re.match(r'^esp = esp \+ (0x[0-9A-Fa-f]+|\d+);', s) is not None
+        return False
+
     # For each ICALL, determine where to insert the save
     insert_before = set()  # map: line_index → True (insert save before this line)
     for icall_idx in icall_indices:
+        if _caller_cleans(icall_idx):
+            insert_before.add(icall_idx)   # save after the argument pushes
+            continue
         # The ICALL line itself is "PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...)"
         # Look backwards for consecutive lines containing PUSH32(esp,
         first_push_idx = icall_idx

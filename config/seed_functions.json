@@ -118,5 +118,77 @@
  {
   "start": "0x0018E1E0",
   "note": "Address-taken (data_imm) code in XPP, clean prologue, no owning function (coverage scan 2026-09-27)."
+ },
+ {
+  "start": "0x000E9190",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: ICALL miss 0xE9190 at runtime (oracle 2026-09-28); swallowed UI update callback"
+ },
+ {
+  "start": "0x000B1400",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: object state handler: mov eax,[esp+4]; movzx ecx,[eax+0x60]  (ref imm@0xB314C)"
+ },
+ {
+  "start": "0x000B2290",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: same pattern (imm@0xB3AF5)"
+ },
+ {
+  "start": "0x000B6450",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: same pattern (imm@0xB7908)"
+ },
+ {
+  "start": "0x000B8740",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: same pattern (imm@0xBA86E)"
+ },
+ {
+  "start": "0x000B8DB0",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: same pattern (imm@0xBA8B9)"
+ },
+ {
+  "start": "0x000B9180",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: same pattern (imm@0xBA8E9)"
+ },
+ {
+  "start": "0x000C1670",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: push ecx; mov eax,[0x512A10]  (imm@0xC3619)"
+ },
+ {
+  "start": "0x000F9C60",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: push ecx; push esi  (imm@0xF9DB7)"
+ },
+ {
+  "start": "0x000FA6A0",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: push ebp; push esi  (imm@0xFAB46)"
+ },
+ {
+  "start": "0x00107A90",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: handler table: mov edx,[esp+4]; mov eax,[edx+0x4608]  (imm@0x1089AE)"
+ },
+ {
+  "start": "0x00107AB0",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: (imm@0x1089B8)"
+ },
+ {
+  "start": "0x00107AD0",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: (imm@0x1089C2)"
+ },
+ {
+  "start": "0x00107AF0",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: (imm@0x1089CC)"
+ },
+ {
+  "start": "0x00109690",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: mov eax,[esp+8]; cmp eax,-3  (imm@0x10AE5D)"
+ },
+ {
+  "start": "0x0010B610",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: jmp thunk -> 0x10CA00  (imm@0x10BB5D)"
+ },
+ {
+  "start": "0x0015735F",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: mov ecx,[esp+4]; and [ecx+0x80],0; jmp 0x157320  (imm@0x157EB1)"
+ },
+ {
+  "start": "0x0018E360",
+  "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: DSOUND: mov edx,[esp+4]; mov eax,[edx+0x14]  (imm@0x11A59C, 0x11AEF0)"
  }
 ]
