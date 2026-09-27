@@ -125,9 +125,30 @@ static void *g_flash_memory = NULL;
  * the mirror top (0x84000000) and the NV2A aperture (0xFD000000). 64 MB matches
  * the console's entire contiguous budget, which is a generous ceiling for a
  * live texture set; with the free-list below, churn is reclaimed. */
-#define XBOX_STAGING_BASE 0x90000000u
+#define XBOX_STAGING_BASE 0x98000000u
 #define XBOX_STAGING_SIZE (64u * 1024u * 1024u)
+/* The GPU sees a staging texture at (VA & 0x0FFFFFFF): the title's D3D masks
+ * the VA itself to form SET_TEXTURE_OFFSET (no MmGetPhysicalAddress). At base
+ * 0x90000000 that landed on physical 0..64 MB -- the XBE image -- so the
+ * renderer sampled code as texels. At 0x98000000 it lands on 0x08000000, past
+ * RAM, where a second view of the same pages makes it the texture data. */
+#define XBOX_STAGING_PHYS (XBOX_STAGING_BASE & 0x0FFFFFFFu)
 static void *g_staging_memory = NULL;
+static void *g_staging_phys_view = NULL;   /* at XBOX_STAGING_PHYS */
+static void *g_staging_uc_view = NULL;     /* at 0x80000000 | XBOX_STAGING_PHYS */
+static void *g_staging_wc_view = NULL;     /* at 0xF0000000 | XBOX_STAGING_PHYS */
+
+/* What the GPU sees at physical address P, as one host range (the xemu
+ * renderer's vram): [0, 64 MB) the contiguous window's storage -- the same
+ * bytes as 0x80000000+P and the tiled 0xF0000000+P --, [64, 128 MB) the heap's
+ * RAM, [128, 192 MB) the staging window. Guest VA P itself cannot serve: low
+ * RAM holds the XBE image, which the contiguous window deliberately does not
+ * alias (see the tiled aperture below), so a GPU reading VA P read the image
+ * or empty RAM where the title had written its buffers at 0x80000000+P. */
+#define XBOX_GPU_PHYS_SPAN 0x0C000000u
+static uint8_t *g_gpu_phys_view = NULL;
+uint8_t *xbox_GpuPhysView(void) { return g_gpu_phys_view; }
+static HANDLE g_staging_mapping = NULL;
 /* The contiguous window's backing section. It is a file mapping rather than
  * plain committed memory for one reason: the tiled aperture has to be a
  * second view of the very same bytes, and only a mapping can be mapped
@@ -2177,21 +2198,106 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * to the mirror (the pre-fix behaviour), so a failure here is not fatal. */
     {
         uintptr_t staging_native = XBOX_STAGING_BASE + g_memory_offset;
+        uintptr_t phys_native    = XBOX_STAGING_PHYS + g_memory_offset;
 
-        g_staging_memory = VirtualAlloc(
-            (LPVOID)staging_native,
-            XBOX_STAGING_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        g_staging_mapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+            0, (DWORD)XBOX_STAGING_SIZE, NULL);
+        if (g_staging_mapping) {
+            g_staging_memory = MapViewOfFileEx(g_staging_mapping, FILE_MAP_ALL_ACCESS,
+                                               0, 0, XBOX_STAGING_SIZE,
+                                               (LPVOID)staging_native);
+            if (g_staging_memory)
+                g_staging_phys_view = MapViewOfFileEx(
+                    g_staging_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                    XBOX_STAGING_SIZE, (LPVOID)phys_native);
+            /* ...and a third at 0x80000000 | phys: D3D turns a resource's
+             * physical address back into a pointer that way (Lock and
+             * friends). Without it that pointer hit the RAM mirror there and
+             * the title wrote its resources over its own image. Mapped before
+             * the RAM mirrors, which then leave these slots alone. */
+            if (g_staging_phys_view)
+                g_staging_uc_view = MapViewOfFileEx(
+                    g_staging_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                    XBOX_STAGING_SIZE,
+                    (LPVOID)((uintptr_t)(XBOX_STAGING_PHYS | 0x80000000u) + g_memory_offset));
+            /* ...and at 0xF0000000 | phys, the tiled/write-combined view the
+             * title fills textures through. Without it those writes landed on
+             * demand-zero pages past the tiled aperture and every staging
+             * texture stayed black. */
+            if (g_staging_uc_view)
+                g_staging_wc_view = MapViewOfFileEx(
+                    g_staging_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                    XBOX_STAGING_SIZE,
+                    (LPVOID)((uintptr_t)(XBOX_STAGING_PHYS | 0xF0000000u) + g_memory_offset));
+        }
+        if (!g_staging_memory)
+            g_staging_memory = VirtualAlloc(
+                (LPVOID)staging_native,
+                XBOX_STAGING_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE
+            );
+        if (g_staging_memory && g_staging_phys_view && g_staging_uc_view) {
+            /* The views must share pages, not merely exist. */
+            volatile uint32_t *a = (volatile uint32_t *)g_staging_memory;
+            volatile uint32_t *b = (volatile uint32_t *)g_staging_phys_view;
+            volatile uint32_t *c = (volatile uint32_t *)g_staging_uc_view;
+            a[1] = 0x5A7A61A5u;
+            if (b[1] != 0x5A7A61A5u || c[1] != 0x5A7A61A5u)
+                fprintf(stderr, "  WARNING: staging views do NOT alias (GPU view"
+                        " %08X, 0x8 view %08X) -- the GPU will sample zeros\n",
+                        b[1], c[1]);
+            a[1] = 0;
+        }
         if (g_staging_memory) {
             fprintf(stderr, "  Texture-staging window: %u MB at Xbox VA "
-                    "0x%08X (off the physical mirror)\n",
-                    XBOX_STAGING_SIZE / (1024 * 1024), XBOX_STAGING_BASE);
+                    "0x%08X, GPU view at physical 0x%08X%s\n",
+                    XBOX_STAGING_SIZE / (1024 * 1024), XBOX_STAGING_BASE,
+                    XBOX_STAGING_PHYS,
+                    g_staging_phys_view && g_staging_uc_view && g_staging_wc_view ? ""
+                        : " (alias FAILED: GPU/D3D views of staging resources are wrong)");
         } else {
             fprintf(stderr, "  WARNING: texture-staging window at 0x%08X failed "
                     "(error %lu); textures fall back to the mirror\n",
                     XBOX_STAGING_BASE, GetLastError());
+        }
+    }
+
+    /* The GPU-physical view (see XBOX_GPU_PHYS_SPAN). Reserve a free range,
+     * release it and map the three views into it; any failure leaves the
+     * renderer on the old identity view. */
+    if (g_contig_mapping && g_staging_mapping && g_mapping_handle
+            && g_memory_size >= 0x08000000u && XBOX_CONTIG_SIZE == 0x04000000u
+            && XBOX_STAGING_PHYS == 0x08000000u) {
+        uint8_t *b = (uint8_t *)VirtualAlloc(NULL, XBOX_GPU_PHYS_SPAN,
+                                             MEM_RESERVE, PAGE_NOACCESS);
+        if (b) {
+            void *v0, *v1 = NULL, *v2 = NULL;
+#if defined(_WIN32)
+            VirtualFree(b, 0, MEM_RELEASE);
+#else
+            VirtualFree(b, XBOX_GPU_PHYS_SPAN, MEM_RELEASE);  /* shim needs the length */
+#endif
+            v0 = MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                                 0x04000000u, b);
+            if (v0)
+                v1 = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS, 0,
+                                     0x04000000u, 0x04000000u, b + 0x04000000u);
+            if (v1)
+                v2 = MapViewOfFileEx(g_staging_mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                                     XBOX_STAGING_SIZE, b + XBOX_STAGING_PHYS);
+            if (v0 && v1 && v2) {
+                g_gpu_phys_view = b;
+                fprintf(stderr, "  GPU physical view: contiguous|heap|staging at"
+                        " host %p (192 MB)\n", (void *)b);
+            } else {
+                if (v2) UnmapViewOfFile(v2);
+                if (v1) UnmapViewOfFile(v1);
+                if (v0) UnmapViewOfFile(v0);
+                fprintf(stderr, "  WARNING: GPU physical view failed (error %lu);"
+                        " the renderer keeps the identity view\n", GetLastError());
+            }
         }
     }
 

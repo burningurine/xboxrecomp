@@ -1966,6 +1966,15 @@ static void bridge_MmGetPhysicalAddress(void)
     g_eax = (addr >= XBOX_CONTIG_BASE &&
              (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
           ? addr - XBOX_CONTIG_BASE : addr;
+    {   /* RECOMP_PHYSLOG: who asks for physical addresses, and of what */
+        static int on = -1, n;
+        if (on < 0) on = getenv("RECOMP_PHYSLOG") != NULL;
+        if (on && n++ < 40) {
+            fprintf(stderr, "  [PHYS] MmGetPhysicalAddress(0x%08X) = 0x%08X ret=0x%08X\n",
+                    addr, g_eax, BRIDGE_MEM32(g_esp));
+            fflush(stderr);
+        }
+    }
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
