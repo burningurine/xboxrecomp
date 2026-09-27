@@ -2438,6 +2438,239 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_0      0x00600100u
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
+#define NV2A_PMC_INTR_EN_0     0x00000140u
+#define NV2A_PCRTC_INTR_EN_0   0x00600140u
+
+/* ---- NV2A interrupt registers ---------------------------------------------
+ *
+ * What the title's D3D expects (Blinx sub_0013D8B0 ISR / 0x13E260 DPC /
+ * sub_0013DAB0 vblank handler; the same shape xemu's nv2a update_irq models):
+ *
+ *   PCRTC_INTR_0     0x600100  bit 0 set by the display each vblank; write-1-
+ *                              to-clear. The title never reads it.
+ *   PCRTC_INTR_EN_0  0x600140  plain; D3D sets 1 at init (sub_001405F3).
+ *   PMC_INTR_0       0x000100  NOT a latch: a live summary. Bit 24 reads set
+ *                              while PCRTC_INTR_0 & PCRTC_INTR_EN_0.
+ *   PMC_INTR_EN_0    0x000140  plain; 1 = drive the line. The ISR writes 0 to
+ *                              quiet the line and its DPC writes back the
+ *                              value D3D saved at ctx+0xB4.
+ *   vector 3 asserted  <=>  PMC_INTR_0 != 0 && (PMC_INTR_EN_0 & 1)
+ *
+ * The vblank handler acknowledges with PCRTC_INTR_0 = 1 and then spins until
+ * PMC_INTR_0 bit 24 drops, so the summary has to follow the acknowledge. It
+ * is also the handler that sets the VerticalBlankEvent, counts vblanks,
+ * programs a pending flip and calls the title's vblank callback -- none of
+ * which happened while PMC_INTR_0 was held at zero.
+ *
+ * The vblank is the only source this runtime raises, so the summary carries
+ * bit 24 only.
+ *
+ * Two ways in, one state:
+ *   - Trapped (Android, MMIO trap): the four registers live here and the trap
+ *     calls xbox_Nv2aIrqRead/Write. Exact.
+ *   - Plain RAM (the oracle): the registers are ordinary guest memory. While a
+ *     vblank is pending PCRTC_INTR_0 holds a sentinel; the title's acknowledge
+ *     overwrites it, which is how a write-1-to-clear is seen at all.
+ *     xbox_Nv2aIrqReflect (the NV2A ack thread, continuously) folds that write
+ *     in and republishes PMC_INTR_0. Safe because the title never reads
+ *     PCRTC_INTR_0 back.
+ *
+ * RECOMP_NV2A_IRQ=legacy restores the old delivery (registers held at zero by
+ * the ack thread, RECOMP_VBLANK_DPC hold window). */
+#define NV2A_PCRTC_SENTINEL    0x5AC30000u
+
+static CRITICAL_SECTION g_nirq_cs;
+static volatile LONG    g_nirq_ready;       /* 0 = not yet, 1 = initialising, 2 = ready */
+static uint32_t         g_nirq_pending;     /* PCRTC_INTR_0 */
+static uint32_t         g_nirq_pcrtc_en;    /* trapped mode only */
+static uint32_t         g_nirq_pmc_en;      /* trapped mode only */
+static int              g_nirq_trapped;
+static volatile LONG    g_nirq_service;     /* a vblank is inside its ISR/DPC */
+
+int xbox_Nv2aIrqModelOn(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *s = getenv("RECOMP_NV2A_IRQ");
+        on = !(s && !strcmp(s, "legacy"));
+    }
+    return on;
+}
+
+static void nirq_init(void)
+{
+    if (g_nirq_ready == 2)
+        return;
+    if (InterlockedCompareExchange(&g_nirq_ready, 1, 0) == 0) {
+        InitializeCriticalSection(&g_nirq_cs);
+        InterlockedExchange(&g_nirq_ready, 2);
+        return;
+    }
+    while (g_nirq_ready != 2)
+        Sleep(0);
+}
+
+static uint32_t nirq_pcrtc_en(void)
+{
+    return g_nirq_trapped ? g_nirq_pcrtc_en
+                          : BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_EN_0);
+}
+
+static uint32_t nirq_pmc_en(void)
+{
+    return g_nirq_trapped ? g_nirq_pmc_en
+                          : BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0);
+}
+
+static uint32_t nirq_summary(void)
+{
+    return (g_nirq_pending & nirq_pcrtc_en() & NV2A_PCRTC_INTR_VBLANK)
+         ? NV2A_PMC_INTR_PCRTC : 0;
+}
+
+/* Plain-RAM mode. Fold: a title write over the sentinel is its write-1-to-
+ * clear. Publish: put the model back into both words. Caller holds g_nirq_cs. */
+static void nirq_fold_locked(void)
+{
+    if (!g_nirq_trapped && g_nirq_pending) {
+        uint32_t v = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0);
+        if (v != (NV2A_PCRTC_SENTINEL | g_nirq_pending))
+            g_nirq_pending &= ~v;
+    }
+}
+
+static void nirq_publish_locked(void)
+{
+    if (g_nirq_trapped)
+        return;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) =
+        g_nirq_pending ? (NV2A_PCRTC_SENTINEL | g_nirq_pending) : 0;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) = nirq_summary();
+}
+
+void xbox_Nv2aIrqReflect(void)
+{
+    if (!xbox_Nv2aIrqModelOn())
+        return;
+    nirq_init();
+    EnterCriticalSection(&g_nirq_cs);
+    nirq_fold_locked();
+    nirq_publish_locked();
+    LeaveCriticalSection(&g_nirq_cs);
+}
+
+/* Nonzero while the timer thread is running the vblank ISR/DPC. The plain-RAM
+ * acknowledge is only seen when the ack thread reflects it, so it must not
+ * sleep then: the title's handler is spinning on PMC_INTR_0. */
+int xbox_Nv2aIrqInService(void)
+{
+    return g_nirq_service != 0;
+}
+
+/* Plain-RAM mode needs someone to reflect while the handler spins, and the ack
+ * thread cannot be relied on for it: it may be inside a long drain (a CPU-
+ * raster frame) exactly then, and every vblank the timer thread spends waiting
+ * is one the pacer drops. So a thread of its own, parked on an event until a
+ * vblank enters service and spinning only for that window. */
+static HANDLE g_nirq_kick;
+
+static DWORD WINAPI nirq_reflector(LPVOID param)
+{
+    (void)param;
+    for (;;) {
+        WaitForSingleObject(g_nirq_kick, INFINITE);
+        while (g_nirq_service) {
+            xbox_Nv2aIrqReflect();
+            SwitchToThread();
+        }
+    }
+}
+
+static void nirq_service_begin(void)
+{
+    InterlockedExchange(&g_nirq_service, 1);
+    if (!g_nirq_trapped) {
+        if (!g_nirq_kick) {
+            HANDLE t;
+            g_nirq_kick = CreateEventW(NULL, FALSE, FALSE, NULL);
+            t = g_nirq_kick ? CreateThread(NULL, 0, nirq_reflector, NULL, 0, NULL) : NULL;
+            if (t)
+                CloseHandle(t);
+        }
+        if (g_nirq_kick)
+            SetEvent(g_nirq_kick);
+    }
+}
+
+static void nirq_service_end(void)
+{
+    InterlockedExchange(&g_nirq_service, 0);
+}
+
+/* ---- register-level model, for the MMIO trap ------------------------------
+ * off is the offset from 0xFD000000. xbox_Nv2aIrqOwns says which offsets this
+ * model answers; the trap handles the rest of the page as plain storage. Call
+ * xbox_Nv2aIrqSetTrapped(1) just BEFORE mmio_trap_register makes those pages
+ * inaccessible: it takes the current enables from RAM and stops mirroring. */
+int xbox_Nv2aIrqOwns(uint32_t off)
+{
+    return off == NV2A_PMC_INTR_0 || off == NV2A_PMC_INTR_EN_0 ||
+           off == NV2A_PCRTC_INTR_0 || off == NV2A_PCRTC_INTR_EN_0;
+}
+
+void xbox_Nv2aIrqSetTrapped(int on)
+{
+    nirq_init();
+    EnterCriticalSection(&g_nirq_cs);
+    if (on && !g_nirq_trapped) {
+        g_nirq_pmc_en   = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0);
+        g_nirq_pcrtc_en = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_EN_0);
+    }
+    g_nirq_trapped = on ? 1 : 0;
+    LeaveCriticalSection(&g_nirq_cs);
+}
+
+uint32_t xbox_Nv2aIrqRead(uint32_t off)
+{
+    uint32_t v = 0;
+    nirq_init();
+    EnterCriticalSection(&g_nirq_cs);
+    switch (off) {
+    case NV2A_PMC_INTR_0:      v = nirq_summary();  break;
+    case NV2A_PMC_INTR_EN_0:   v = nirq_pmc_en();   break;
+    case NV2A_PCRTC_INTR_0:    v = g_nirq_pending;  break;
+    case NV2A_PCRTC_INTR_EN_0: v = nirq_pcrtc_en(); break;
+    }
+    LeaveCriticalSection(&g_nirq_cs);
+    return v;
+}
+
+void xbox_Nv2aIrqWrite(uint32_t off, uint32_t val)
+{
+    nirq_init();
+    EnterCriticalSection(&g_nirq_cs);
+    switch (off) {
+    case NV2A_PMC_INTR_0:      break;                          /* no software interrupts */
+    case NV2A_PMC_INTR_EN_0:   g_nirq_pmc_en = val;     break;
+    case NV2A_PCRTC_INTR_0:    g_nirq_pending &= ~val;  break; /* write-1-to-clear */
+    case NV2A_PCRTC_INTR_EN_0: g_nirq_pcrtc_en = val;   break;
+    }
+    LeaveCriticalSection(&g_nirq_cs);
+}
+
+/* The display reached vblank: latch it. Returns whether vector 3 is asserted. */
+static int nirq_vblank(void)
+{
+    int line;
+    nirq_init();
+    EnterCriticalSection(&g_nirq_cs);
+    nirq_fold_locked();                         /* an acknowledge still in RAM */
+    g_nirq_pending |= NV2A_PCRTC_INTR_VBLANK;
+    nirq_publish_locked();
+    line = nirq_summary() != 0 && (nirq_pmc_en() & 1u);
+    LeaveCriticalSection(&g_nirq_cs);
+    return line;
+}
 
 /* ---- vblank cadence -------------------------------------------------------
  * The guest paces its game loop off the vblank callback's frame counter, so the
@@ -2613,62 +2846,77 @@ static void kernel_vblank_fire(long long now)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    int vdpc = vblank_dpc_on();
+    int model = xbox_Nv2aIrqModelOn();
+    int vdpc = model || vblank_dpc_on();
     uint32_t heartbeat0 = BRIDGE_MEM32(0x0051A0A0u);
     int title_beat = 0;
-    if (vdpc)
-        g_vblank_hold_until_ns = kb_mono_ns() + 2000000;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    int line = 1;
+    if (model) {
+        line = nirq_vblank();
+    } else {
+        if (vdpc)
+            g_vblank_hold_until_ns = kb_mono_ns() + 2000000;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    }
 
     {
         static unsigned n;
         static unsigned n_inv, n_claim, n_decl;
         static long long last_report;
-        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-        if (vdpc) {
-            kernel_drain_dpcs();          /* the DPC the ISR just queued */
-            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
-            BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   &= ~NV2A_PMC_INTR_PCRTC;
-            g_vblank_hold_until_ns = 0;
-            /* The title's handler called its own vblank callback: don't
-             * beat the heartbeat a second time below. */
-            title_beat = BRIDGE_MEM32(0x0051A0A0u) != heartbeat0;
+        int claimed = 0;          /* line not asserted: the title has it disabled */
+        if (line) {
+            if (model)
+                nirq_service_begin();
+            claimed = kernel_raise_interrupt(NV2A_VECTOR);
+            if (vdpc) {
+                kernel_drain_dpcs();          /* the DPC the ISR just queued */
+                if (!model) {
+                    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
+                    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   &= ~NV2A_PMC_INTR_PCRTC;
+                    g_vblank_hold_until_ns = 0;
+                }
+                /* The title's handler called its own vblank callback: don't
+                 * beat the heartbeat a second time below. */
+                title_beat = BRIDGE_MEM32(0x0051A0A0u) != heartbeat0;
+            }
+            if (model)
+                nirq_service_end();
         }
         if (n++ < 3)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
+                    !line ? "masked (PMC_INTR_EN_0 off)" :
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
 
-        /* Drive the D3D8 vertical-blank callback.
+        /* The D3D8 vertical-blank callback.
          *
-         * The title registers a vblank callback (D3DDevice_SetVerticalBlank-
-         * Callback -> sub_00135F80) stored at device+0x1DA8, device = [0x143B58];
-         * its body sub_000A4930 increments the frame counter [0x51A0A0]. On
-         * hardware the D3D8 kernel invokes it every vblank -- but nothing in the
-         * recompiled game or D3D8 lib reads device+0x1DA8, so on our side it was
-         * never called. Measured on device: the ISR claims every vblank (flip
-         * done, DPC queued) yet [0x51A0A0] stays 0, so the per-frame throttle
-         * sub_000A35D0 (`while [0x51A0A0] < 1`) busy-waits ~8.6s per frame
-         * (~0.11 fps -- the intro never finishes). Invoke the registered callback
-         * here on each claimed vblank (claimed => the device is up and a flip
-         * completed), so the heartbeat ticks at the vblank rate and frames pace
-         * normally. The callback ignores its D3DVBLANKDATA* arg and returns with a
-         * plain `ret`; save and restore g_esp so the stack is balanced whatever
-         * the convention. Opt out with RECOMP_NO_VBLANK_CB. */
-        static int flip_kick = -1;
-        if (flip_kick < 0) flip_kick = getenv("RECOMP_FLIP_KICK") != NULL;
-        /* Under RECOMP_FLIP_KICK the callback must fire every vblank, not only on
-         * a claimed one: the kick clears the phantom present-pending below, which
-         * makes the vector-3 ISR sub_0013D8B0 (claims only while [device+0x140]!=0)
-         * go quiet -- so the heartbeat has to stand on its own or [0x51A0A0] stalls. */
-        if ((claimed > 0 || flip_kick) && !title_beat) {
+         * The title registers it with D3DDevice_SetVerticalBlankCallback
+         * (sub_00135F80) at device+0x1DA8, device = [0x143B58]; its body
+         * sub_000A4930 increments the frame counter [0x51A0A0] the scene
+         * throttle waits on. The caller is the title's own vblank handler,
+         * sub_0013DAB0 (13DB7E: call [ctx+0x190], ctx = device+0x1C18) -- a
+         * ctx-relative load, which is why a search for 0x1DA8 finds nothing.
+         *
+         * With the interrupt model that handler runs, so the callback needs no
+         * help. The one gap is before the title has registered it: the first
+         * scene load (sub_00094A20 file_select -> sub_000A9CE0) throttles on
+         * [0x51A0A0] before D3DDevice_SetVerticalBlankCallback, so beat the
+         * counter directly -- exactly what sub_000A4930 would -- until then.
+         * dev==0 (device struct not up) is left alone.
+         *
+         * RECOMP_NV2A_IRQ=legacy keeps the old path, which calls the callback
+         * from here on each claimed vblank. */
+        if (!title_beat) {
             static int cb_off = -1;
+            uint32_t dev = BRIDGE_MEM32(0x00143B58u);
+            uint32_t cb  = dev ? BRIDGE_MEM32(dev + 0x1DA8u) : 0;
             if (cb_off < 0) cb_off = getenv("RECOMP_NO_VBLANK_CB") != NULL;
-            if (!cb_off) {
-                uint32_t dev = BRIDGE_MEM32(0x00143B58u);
-                uint32_t cb  = dev ? BRIDGE_MEM32(dev + 0x1DA8u) : 0;
+            if (model) {
+                if (dev && !cb)
+                    BRIDGE_MEM32(0x0051A0A0u) = BRIDGE_MEM32(0x0051A0A0u) + 1;
+            } else if (claimed > 0 && !cb_off) {
                 recomp_func_t cbfn = cb ? recomp_lookup(cb) : NULL;
                 if (!cbfn && cb) cbfn = recomp_lookup_manual(cb);
                 if (cbfn) {
@@ -2677,58 +2925,9 @@ static void kernel_vblank_fire(long long now)
                     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* return address */
                     cbfn();
                     g_esp = saved_esp;
-                } else {
-                    /* The title's vblank callback (device+0x1DA8) isn't
-                     * registered/resolvable yet. The very first scene load
-                     * (sub_00094A20 file_select -> sub_000A9CE0) throttles on
-                     * [0x51A0A0] BEFORE the game has called
-                     * D3DDevice_SetVerticalBlankCallback, so cb==0, the callback
-                     * body sub_000A4930 never runs, the counter stays 0 and the
-                     * `while [0x51A0A0] < N` busy-wait hangs at boot (seen only
-                     * when thread timing doesn't happen to register the callback
-                     * before this wait, e.g. a vanilla/no-XSUSPEND run). A
-                     * claimed vblank means a real frame elapsed, so beat the
-                     * counter directly here -- exactly what sub_000A4930 would --
-                     * until the callback registers and the branch above resumes.
-                     * dev==0 (device struct not up) is left alone: no flip yet. */
-                    if (dev)
-                        BRIDGE_MEM32(0x0051A0A0u) = BRIDGE_MEM32(0x0051A0A0u) + 1;
+                } else if (dev) {
+                    BRIDGE_MEM32(0x0051A0A0u) = BRIDGE_MEM32(0x0051A0A0u) + 1;
                 }
-            }
-        }
-
-        /* RECOMP_FLIP_KICK: clear a phantom "present pending" left by device init.
-         * sub_0013E48D:53924 / sub_0013E510:53995 set [ctx+0xB4]=1 (ctx=0x145778)
-         * and mirror it into [device+0x140] (0xFD000140). A flip retires and clears
-         * that only once one is QUEUED, but file_select (sub_00094A20) gates its
-         * asset load on a present-wait BEFORE it ever calls Swap, so the flip queue
-         * stays empty ([ctx+0x174]/[ctx+0x180]==0), nothing retires, and the wait
-         * deadlocks. Our nv2a renders synchronously (no real async flip to await),
-         * so a pending with no queued entry is a genuine phantom. device+0x140 is
-         * dual-purpose (also the vector-3 ISR sub_0013D8B0's accept gate), so we
-         * DON'T just force it -- the callback above is fired unconditionally under
-         * flip_kick so [0x51A0A0] survives the ISR going quiet, and here we clear
-         * the phantom at its source (ctx+0xB4) plus the mirror. Guarded to the
-         * pre-scene-0 boot wait with no flip ever queued, so it self-disables the
-         * instant a real flip or scene appears. Off unless RECOMP_FLIP_KICK set. */
-        if (flip_kick) {
-            static unsigned phantom_stuck;
-            uint32_t pend  = BRIDGE_MEM32(0x0014582Cu);      /* ctx+0xB4  pending */
-            uint32_t q0    = BRIDGE_MEM32(0x001458ECu);      /* ctx+0x174 flip buf0 */
-            uint32_t q1    = BRIDGE_MEM32(0x001458F8u);      /* ctx+0x180 flip buf1 */
-            uint32_t scene = BRIDGE_MEM32(0x0051A0FCu) & 0x7Fu;
-            if (pend == 1 && q0 == 0 && q1 == 0 && scene == 0) {
-                if (++phantom_stuck >= 30) {                 /* ~0.5s sustained */
-                    BRIDGE_MEM32(0x0014582Cu) = 0;           /* clear ctx+0xB4      */
-                    BRIDGE_MEM32(0xFD000140u) = 0;           /* clear the mirror    */
-                    fprintf(stderr, "  [FLIPKICK] cleared phantom present-pending"
-                            " (ctx+0xB4, device+0x140) after %u vblanks; heartbeat"
-                            " decoupled\n", phantom_stuck);
-                    fflush(stderr);
-                    phantom_stuck = 0;
-                }
-            } else {
-                phantom_stuck = 0;
             }
         }
 

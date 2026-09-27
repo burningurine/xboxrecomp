@@ -192,6 +192,19 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* NV2A interrupt registers (kernel_bridge.c): PMC_INTR_0/_EN_0 and
+ * PCRTC_INTR_0/_EN_0, offsets from 0xFD000000. The MMIO trap routes the offsets
+ * xbox_Nv2aIrqOwns() accepts to Read/Write; call xbox_Nv2aIrqSetTrapped(1)
+ * just before trapping those pages. Without a trap the NV2A ack thread calls
+ * xbox_Nv2aIrqReflect(). RECOMP_NV2A_IRQ=legacy turns the model off. */
+int      xbox_Nv2aIrqModelOn(void);
+int      xbox_Nv2aIrqOwns(uint32_t off);
+uint32_t xbox_Nv2aIrqRead(uint32_t off);
+void     xbox_Nv2aIrqWrite(uint32_t off, uint32_t val);
+void     xbox_Nv2aIrqSetTrapped(int on);
+void     xbox_Nv2aIrqReflect(void);
+int      xbox_Nv2aIrqInService(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /* Reload the XBE image to guest memory (clean .data/.bss) for reboot-to-self,

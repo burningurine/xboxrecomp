@@ -1016,14 +1016,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
      * the gaps clears each sync at memory speed; the window lapses only when the
      * guest stops submitting, so an idle guest still costs no core. */
     DWORD hot_until = 0;
+    int irq_model = xbox_Nv2aIrqModelOn();
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        /* The interrupt registers first, and outside the drain lock: the
+         * title's vblank handler acknowledges PCRTC_INTR_0 and then spins until
+         * PMC_INTR_0 follows, and this is where plain RAM follows. */
+        xbox_Nv2aIrqReflect();
         /* Drain before reflecting anything: every idle/fence/GET value below
          * claims work is done, so it must describe work that IS done. A guest
          * thread holding the lock is draining right now (possibly waiting on
          * the host GPU); don't spin on it, and don't reflect half-done work --
          * come back shortly. */
         if (!drain_trylock()) {
-            Sleep(1);     /* the holder drains; yielding in a loop cost a core */
+            if (!xbox_Nv2aIrqInService())
+                Sleep(1); /* the holder drains; yielding in a loop cost a core */
             continue;
         }
         if (nv2a_drain_locked(regs, GetTickCount()))
@@ -1036,6 +1042,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 volatile uint32_t *r =
                     (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
                 uint32_t mask = NV2A_ACK[i].busy_mask;
+                /* The interrupt model owns these two (kernel_bridge.c). */
+                if (irq_model && (NV2A_ACK[i].offset == 0x000100 ||
+                                  NV2A_ACK[i].offset == 0x600100))
+                    continue;
                 if (vbl_held) {    /* a vblank the title's DPC has yet to see */
                     if (NV2A_ACK[i].offset == 0x000100) mask &= ~(1u << 24);
                     if (NV2A_ACK[i].offset == 0x600100) mask &= ~1u;
@@ -1144,8 +1154,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * regardless of the spinner, so a drained-but-waiting present's idle/flush
          * condition clears within ~1 ms instead of once per quantum, while an idle
          * guest still costs no core. Active frames are unaffected: they stay hot
-         * and never reach this yield. */
-        if (GetTickCount() >= hot_until)
+         * and never reach this yield. Nor does a vblank in service: its handler
+         * is spinning on PMC_INTR_0 until the reflect at the top runs. */
+        if (GetTickCount() >= hot_until && !xbox_Nv2aIrqInService())
             Sleep(1);
     }
     return 0;
