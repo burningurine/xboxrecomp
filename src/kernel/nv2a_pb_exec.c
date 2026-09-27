@@ -40,6 +40,11 @@
 static const NV2ABackend *s_backend;
 void nv2a_backend_register(const NV2ABackend *backend) { s_backend = backend; }
 const NV2ABackend *nv2a_backend(void) { return s_backend; }
+void nv2a_pb_exec_segment_end(void)
+{
+    if (s_backend && s_backend->flush)
+        s_backend->flush();
+}
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"

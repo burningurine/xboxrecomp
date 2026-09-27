@@ -25,6 +25,10 @@ typedef struct NV2ABackend {
     int  (*present)(void *window, int stretch);
     /* The presentation window went away. */
     void (*window_lost)(void);
+    /* End of a drained pushbuffer segment: the guest runs again next and may
+     * rewrite vertex/texture memory, so any draw the backend is still holding
+     * back must be recorded now. Optional. */
+    void (*flush)(void);
 } NV2ABackend;
 
 void nv2a_backend_register(const NV2ABackend *backend);

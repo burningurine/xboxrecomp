@@ -284,10 +284,13 @@ static void pb_scan_core(uint32_t start_va, uint32_t end_va, uint32_t *jump_off)
     s_tot_segments++;
 }
 
+extern void nv2a_pb_exec_segment_end(void);
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     uint32_t jump_off;
     pb_scan_core(start_va, end_va, &jump_off);
+    nv2a_pb_exec_segment_end();
 }
 
 /* Consume everything from from_va up to put_va, following JUMPs. D3D's
@@ -308,4 +311,5 @@ void nv2a_pb_drain(uint32_t from_va, uint32_t put_va, uint32_t phys_base)
             break;                            /* reached PUT (or the bound) */
         va = phys_base | (jump_off & 0x0FFFFFFFu);
     }
+    nv2a_pb_exec_segment_end();
 }
