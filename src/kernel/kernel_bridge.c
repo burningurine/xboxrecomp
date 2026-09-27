@@ -3022,15 +3022,30 @@ static volatile uint32_t g_irq_lines;
 void xbox_SetInterruptLine(uint32_t vector, int level)
 {
     if (vector >= XBOX_MAX_VECTORS) return;
+#if defined(_MSC_VER)
+    if (level) _InterlockedOr((volatile long *)&g_irq_lines, (long)(1u << vector));
+    else       _InterlockedAnd((volatile long *)&g_irq_lines, (long)~(1u << vector));
+#else
     if (level) __atomic_fetch_or(&g_irq_lines, 1u << vector, __ATOMIC_SEQ_CST);
     else       __atomic_fetch_and(&g_irq_lines, ~(1u << vector), __ATOMIC_SEQ_CST);
+#endif
 }
 
 static void kernel_device_irq_tick(void)
 {
+#if defined(_MSC_VER)
+    uint32_t lines = g_irq_lines;                /* volatile read */
+#else
     uint32_t lines = __atomic_load_n(&g_irq_lines, __ATOMIC_ACQUIRE);
+#endif
     while (lines) {
+#if defined(_MSC_VER)
+        unsigned long bit;
+        _BitScanForward(&bit, lines);
+        uint32_t v = (uint32_t)bit;
+#else
         uint32_t v = (uint32_t)__builtin_ctz(lines);
+#endif
         lines &= lines - 1;
         if (xbox_GetConnectedInterrupt(v))
             kernel_raise_interrupt(v);
