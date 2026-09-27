@@ -3043,34 +3043,44 @@ static void kernel_gpu_irq_tick(void)
     }
 }
 
-/* Opt-in memory watcher: RECOMP_MEMWATCH="0xBASE:NDWORDS" dumps the dwords in
- * [BASE, BASE+NDWORDS*4) once a second, printing only those that changed since
- * the last tick. Used to find an in-memory swap/vblank counter the guest polls
- * (and to see whether anything advances it). Inert unless the env var is set. */
+/* Opt-in memory watcher: RECOMP_MEMWATCH="0xBASE:NDWORDS[,0xBASE:NDWORDS...]"
+ * (up to 16 ranges, 256 dwords in all) dumps the dwords once a second,
+ * printing only those that changed since the last tick. Used to find an
+ * in-memory counter the guest polls, or which of several gates differs from a
+ * reference run. Inert unless the env var is set. */
 static void memwatch_tick(void)
 {
     static int inited = 0;
-    static uint32_t base = 0;
-    static int ndw = 0;
+    static uint32_t rbase[16];
+    static int rn[16], nranges = 0;
     static uint32_t prev[256];
     static long long next_ms = 0;
     long long now;
-    int i;
+    int i, r, k;
 
     if (!inited) {
         const char *e = getenv("RECOMP_MEMWATCH");
+        int total = 0;
         inited = 1;
-        if (e && *e) {
+        while (e && *e && nranges < 16 && total < 256) {
             const char *c = strchr(e, ':');
-            base = (uint32_t)strtoul(e, NULL, 0);
-            ndw = c ? atoi(c + 1) : 64;
-            if (ndw < 1) ndw = 1;
-            if (ndw > 256) ndw = 256;
-            for (i = 0; i < ndw; i++)
-                prev[i] = 0xDEADBEEFu;
+            const char *comma = strchr(e, ',');
+            uint32_t base = (uint32_t)strtoul(e, NULL, 0);
+            int n = (c && (!comma || c < comma)) ? atoi(c + 1) : 64;
+            if (n < 1) n = 1;
+            if (total + n > 256) n = 256 - total;
+            if (base) {
+                rbase[nranges] = base;
+                rn[nranges] = n;
+                nranges++;
+                total += n;
+            }
+            e = comma ? comma + 1 : NULL;
         }
+        for (i = 0; i < 256; i++)
+            prev[i] = 0xDEADBEEFu;
     }
-    if (!base)
+    if (!nranges)
         return;
 
     now = (long long)GetTickCount64();
@@ -3078,12 +3088,15 @@ static void memwatch_tick(void)
         return;
     next_ms = now + 1000;
 
-    for (i = 0; i < ndw; i++) {
-        uint32_t v = BRIDGE_MEM32(base + (uint32_t)i * 4);
-        if (v != prev[i]) {
-            fprintf(stderr, "  [MEMWATCH] 0x%08X = 0x%08X (was 0x%08X)\n",
-                    base + (uint32_t)i * 4, v, prev[i]);
-            prev[i] = v;
+    for (r = 0, k = 0; r < nranges; r++) {
+        for (i = 0; i < rn[r]; i++, k++) {
+            uint32_t a = rbase[r] + (uint32_t)i * 4;
+            uint32_t v = BRIDGE_MEM32(a);
+            if (v != prev[k]) {
+                fprintf(stderr, "  [MEMWATCH] 0x%08X = 0x%08X (was 0x%08X)\n",
+                        a, v, prev[k]);
+                prev[k] = v;
+            }
         }
     }
     fflush(stderr);
