@@ -233,6 +233,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *blinx_get_android_window(void);   /* jni_bridge.c */
 #include "../nv2a/nv2a_pgraph_gles.h"          /* GLES 3D overlay (object-space batches) */
 #include "../kernel/frame_stats.h"
+#include "../kernel/nv2a_backend.h"
 #include <time.h>
 
 #define FBLOG(...) __android_log_print(ANDROID_LOG_INFO, "blinx-fb", __VA_ARGS__)
@@ -270,8 +271,38 @@ static double fb_now_ms(void)
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     const char *pin = getenv("RECOMP_FB_VA");
+    const NV2ABackend *be = nv2a_backend();
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch) s_fb_pitch = pitch;
+    if (be && be->scanout)
+        be->scanout(s_fb_va, s_fb_pitch, s_fb_width, s_fb_height);
+}
+
+/* A registered GPU backend (nv2a_backend.h) presents through its own API
+ * (Vulkan swapchain) -- an ANativeWindow takes one producer API at a time, so
+ * this thread then never creates an EGL surface. Returns 0 if the backend
+ * cannot present, and the caller falls back to the EGL path. */
+static int fb_thread_backend(const NV2ABackend *be)
+{
+    ANativeWindow *had = NULL;
+    FBLOG("presenter: using GPU backend '%s'", be->name ? be->name : "?");
+    while (s_fb_running) {
+        ANativeWindow *w = (ANativeWindow *)blinx_get_android_window();
+        if (w != had && had && be->window_lost)
+            be->window_lost();
+        had = w;
+        if (!w) { usleep(50000); continue; }
+        double t0 = fb_now_ms();
+        int r = be->present(w, s_aspect_stretch == 1);
+        if (r < 0) {
+            FBLOG("presenter: backend cannot present; falling back to GLES");
+            if (be->window_lost) be->window_lost();
+            return 0;
+        }
+        if (r == 0) { usleep(8000); continue; }   /* nothing rendered yet */
+        fs_host_present(fb_now_ms() - t0);        /* FIFO present paces to vsync */
+    }
+    return 1;
 }
 
 static GLuint fb_compile(GLenum type, const char *src)
@@ -288,6 +319,12 @@ static GLuint fb_compile(GLenum type, const char *src)
 static void *fb_thread(void *unused)
 {
     (void)unused;
+
+    {
+        const NV2ABackend *be = nv2a_backend();
+        if (be && be->present && fb_thread_backend(be))
+            return NULL;
+    }
 
     /* EGL display + config + context persist for the whole thread; the window
      * SURFACE is (re)created whenever the app's Surface appears, changes, or is

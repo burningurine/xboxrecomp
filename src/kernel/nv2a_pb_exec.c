@@ -32,6 +32,14 @@
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "frame_stats.h"
+#include "nv2a_backend.h"
+
+/* Optional GPU backend (see nv2a_backend.h). While one is registered the
+ * executor still tracks all state and kernel-visible side effects, but its
+ * own CPU/GLES rasterisers are skipped: the backend draws the same stream. */
+static const NV2ABackend *s_backend;
+void nv2a_backend_register(const NV2ABackend *backend) { s_backend = backend; }
+const NV2ABackend *nv2a_backend(void) { return s_backend; }
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -2345,6 +2353,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    if (s_backend && s_backend->method)
+        s_backend->method(subch, method, param);
+
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
@@ -2371,7 +2382,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.clear_color = param;
         break;
     case NV097_CLEAR_SURFACE:
-        clear_surface(param);
+        if (!s_backend)
+            clear_surface(param);
 #if defined(__ANDROID__)
         if (nv2a_gles_enabled())
             nv2a_gles_clear(s_gpu.clear_color);
@@ -2390,7 +2402,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * with INLINE_ARRAY, or indices into the title's own arrays. */
             fs_draw(s_gpu.imm_count ? s_gpu.imm_count
                     : s_gpu.inline_count ? s_gpu.inline_count : s_gpu.idx_count);
-            if (s_gpu.imm_count)
+            if (s_backend)
+                ;                       /* the backend rendered it */
+            else if (s_gpu.imm_count)
                 draw_immediate();
             else if (s_gpu.inline_count)
                 draw_inline_array();

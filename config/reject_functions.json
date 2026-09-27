@@ -1,0 +1,8 @@
+[
+ {"start": "0x00088277", "note": "Mid-instruction (inside fcomp [0x198b44] @0x88275) of sub_00088190 (0x88190-0x88467). The split left sub_00088190 without its pop/ret epilogue: esp returned 0x10 low, ebx/esi/edi dirty, the caller chain ran on a shifted frame, sub_00088B80's /GS check read the wrong slot -> KeBugCheck(0) -> AF120 returned garbage ebx/edi -> AF990 vblank throttle wedged at scene 0x89. Found via RECOMP_ABI_CHECK (2026-09-27)."},
+ {"start": "0x00029954", "note": "Mid-instruction (inside mov [eax],0x41200000 @0x29952) of sub_00029870; decodes as garbage. midinsn_scan 2026-09-27."},
+ {"start": "0x0002F0F7", "note": "Mid-instruction (inside call 0x91fa0 @0x2f0f4) of sub_0002F020; decodes as garbage (push es...). midinsn_scan 2026-09-27."},
+ {"start": "0x0003F59D", "note": "Mid-instruction (inside test ch,2 @0x3f59b) of sub_0003F4E0. midinsn_scan 2026-09-27."},
+ {"start": "0x00059A2A", "note": "Mid-instruction (inside mov eax,[esp+8] @0x59a27) of sub_00059A20; decodes as garbage (out dx,eax). midinsn_scan 2026-09-27."},
+ {"start": "0x0006A340", "note": "Mid-instruction (inside fst [esi+0x1c] @0x6a33f) of sub_0006A320. midinsn_scan 2026-09-27."}
+]
