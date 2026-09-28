@@ -60,18 +60,6 @@
   "note": "PsCreateSystemThreadEx StartContext1 (pool worker) observed at runtime; decodes as a function body."
  },
  {
-  "start": "0x00127514",
-  "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
- },
- {
-  "start": "0x0012768F",
-  "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
- },
- {
-  "start": "0x001276C0",
-  "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
- },
- {
   "start": "0x00191763",
   "note": "Indirect-call target observed at runtime (round-2 icall-feedback); worker inner-work fn missed by static discovery."
  },
@@ -190,5 +178,625 @@
  {
   "start": "0x0018E360",
   "note": "Swallowed-function scan 2026-09-28 (\"Blinx work\"), verified entry: DSOUND: mov edx,[esp+4]; mov eax,[edx+0x14]  (imm@0x11A59C, 0x11AEF0)"
+ },
+ {
+  "start": "0x0010C700",
+  "note": "FMV CRITICAL. mwPlyExecSvr body (loops the 8 mwPly handles at 0xABEAA8 stride 0x190 -> sub_0010C5E0 -> SFD exec). Reached only by tail jmp from 0x10C770 (the SVM type-4 server registered by mwPlyInitSfdFx); was an unresolved no-op stub, so the SFD server never ran: SFD state [S+0x40] stuck at 1 on oracle and RP6. Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0010C1F0",
+  "note": "FMV CRITICAL. SFD module 1 exec body; module table 0x1DD0A8[+8] = thunk 0x10C260 -> jmp 0x10C1F0 (was a no-op stub). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0010B2B0",
+  "note": "FMV CRITICAL. SFD module 2 exec body (video, param 5); table 0x1DD00C[+8] = thunk 0x10B330 -> jmp 0x10B2B0 (was a no-op stub). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00108370",
+  "note": "FMV CRITICAL. SFD module 3 exec body (audio, param 6); table 0x1DCF80[+8] = thunk 0x108910 -> jmp 0x108370 (was a no-op stub). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00117C50",
+  "note": "SFD API body: mwPly wrapper 0x10C8C0 tail-jmps here (then jmp 0x107850). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00117C60",
+  "note": "SFD API body: mwPly wrapper 0x10C8F0 tail-jmps here (then jmp 0x1078A0). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00117C70",
+  "note": "SFD API body: mwPly wrapper 0x10C920 tail-jmps here (then jmp 0x1077B0). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00117C80",
+  "note": "SFD API body: mwPly wrapper 0x10C950 tail-jmps here (then jmp 0x107800). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00101164",
+  "note": "mwSnd: jne target in sub_00101140 (gen extent ends at 0x101160). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001011C4",
+  "note": "mwSnd: ret target of sub_00101140/0x101164 branches. Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00101CB4",
+  "note": "mwSnd: je target in sub_00101C90 (function split by false start 0x101CAF). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00101CB7",
+  "note": "mwSnd: jne target in sub_00101C90 (non-NULL path; split by false start 0x101CAF). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00108575",
+  "note": "SFD: js target in sub_001083E0 (split at 0x1084C3). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001085CA",
+  "note": "SFD: epilogue target of sub_001083E0 branches (split at 0x1084C3). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0010AEFE",
+  "note": "SFD: jne target in sub_0010AE26 (split by start 0x10AE5C). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0010C826",
+  "note": "mwPly: jne target (ret) in sub_0010C7C0 (split at 0x10C81B/0x10C821). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001178CA",
+  "note": "SFD: branch target in sub_00117120 (split at 0x1178AC). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00117A38",
+  "note": "SFD: branch target in sub_00117120 (split at 0x1178AC). Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00115AB0",
+  "note": "SFD video bitstream loop head: jl target from 0x115C62. Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000FFB54",
+  "note": "CRI: jle target (epilogue) in sub_000FF950. Found by the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0001FC67",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0002FDF6",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0003BBB0",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0003BBE0",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0004F9A6",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0005F951",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00070224",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00074DE0",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0007FFB4",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00080020",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0008F940",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0008F976",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0008FE30",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0008FE46",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000A3630",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000ABF85",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000ABF8B",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000ABFCB",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000AFE95",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000BFF30",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000CF796",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000CF7B4",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000D02F2",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000D8B71",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000D8B77",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000EFB32",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000EFE50",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000F01D2",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0011EE20",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0011EEE4",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0011F1B3",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0011F2B0",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0011F346",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0011F3A9",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00120222",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00121A30",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00121AD7",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00122981",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001229D0",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00122AA3",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00122D63",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00122E5C",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00122F51",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00124417",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00127342",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001287C6",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001292C4",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012BBD5",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012C6D8",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012D06E",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012D071",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012D509",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012D524",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012F965",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012F982",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012F991",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012F9AD",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012FC38",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012FF36",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012FFC5",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012FFD7",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00130075",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0013074E",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001307B7",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0013890C",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00138B10",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00138B18",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0013EBF0",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0013FA00",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0013FA30",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00148B9E",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00148BAF",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0014DE76",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0014FD80",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0014FEE9",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0015016B",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001502AB",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001504BF",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001504E6",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001544F2",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001598B1",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0015B285",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0015D97F",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0015DAE6",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001601B8",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001601CE",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001601E9",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016623A",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016629A",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001662A8",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001694ED",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00169A8A",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00169A98",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016BABE",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00177399",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017AA9E",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017AD48",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017FA1B",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017FB02",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017FB04",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017FF01",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017FFDA",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0018007E",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00180091",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00189A8C",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0018D201",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0018D490",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0018FF35",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0018FF68",
+  "note": "Tier C jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); instruction boundary inside a gen function, seeded as an overlapping tail-jump function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0001FADE",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0001FB07",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00053FE6",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00054034",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x00074E00",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0007509D",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000750A4",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x000750AE",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0012B9BE",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016B046",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016CC3A",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016CDBB",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016F186",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016F1AE",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0016F1B9",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001710F5",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0017E79C",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x001804AC",
+  "note": "Tier D jmp/jcc target that was an unresolved no-op stub (\"return to caller\"); real code not covered by any gen function. From the 2026-09-28 unresolved-stub audit (Blinx work)."
+ },
+ {
+  "start": "0x0018C8A0",
+  "note": "Code pointer in .rdata (0x1DDE00), sub esp,0x10 after padding in PSGSFD00; in no function (the data-pointer pass skips .rdata because the XBE flags it executable). rdata_ptrs scan 2026-09-28."
+ },
+ {
+  "start": "0x0018F880",
+  "note": "Start of section PSGSFD_I (by its name the I-picture decoder), entry 0 of the SFD picture decoder vtable at .rdata 0x1DDDD4 {0x18F880, 0x190540, 0x18FE60, 0x103A50}; the section had no function at all. rdata_ptrs scan 2026-09-28."
+ },
+ {
+  "start": "0x0018FE60",
+  "note": "Section PSGSFD_B (by its name the B-picture decoder), after nop padding, entry 2 of the SFD picture decoder vtable at .rdata 0x1DDDD4 {0x18F880, 0x190540, 0x18FE60, 0x103A50}; the real entry of the body the tail-jump alias 0x18FF02 and seeds 0x18FF35/0x18FF68 land in. rdata_ptrs scan 2026-09-28."
+ },
+ {
+  "start": "0x00190540",
+  "note": "Start of section PSGSFD_P (by its name the P-picture decoder), entry 1 of the SFD picture decoder vtable at .rdata 0x1DDDD4 {0x18F880, 0x190540, 0x18FE60, 0x103A50}; the section had no function at all. rdata_ptrs scan 2026-09-28."
+ },
+ {
+  "start": "0x00047AD0",
+  "note": "Code pointer in .rdata (0x198F0C): push esi right after the jump table at 0x47AC0; in no function. rdata_ptrs scan 2026-09-28."
+ },
+ {
+  "start": "0x0005DA40",
+  "note": "Code pointer in .rdata (0x19936C): push ebx after padding; in no function. rdata_ptrs scan 2026-09-28."
+ },
+ {
+  "start": "0x000FDD50",
+  "note": "SJ ring buffer PutChunk, entry +0x20 of the SJRBF vtable in .data (0x38CC10); 16-aligned after nop padding, inside sub_000FDC50's recorded extent so never a function or label. Found by Blinx work (FMV verified on RP6 with it, gen_s21b) 2026-09-28."
+ },
+ {
+  "start": "0x000579E0",
+  "note": "Method of a game-object vtable in .data (0x1E1B54, entry 1 of 13): sub esp,0x3c right after the jump table at 0x579D0; in no function. vtable_scan 2026-09-28."
  }
 ]

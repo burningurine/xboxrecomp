@@ -921,8 +921,25 @@ class FunctionDetector:
             sec_ranges[sec.name] = (sec.virtual_addr,
                                     sec.virtual_addr + sec.virtual_size)
 
+        # Only evidence of a function of its own bounds the function before
+        # it. A seed, a tail-jump target or an address taken as an immediate
+        # is an entry point, and it routinely lands inside another function's
+        # body: Blinx's unresolved-stub audit seeded ~100 such labels, and the
+        # code the seeds made reachable exposed more immediates. Clamping the
+        # enclosing function at each of them split it, and a split breaks a
+        # switch whose arms end up in different pieces: the table no longer
+        # resolves inside one function, the dispatch becomes an indirect jump
+        # to case labels that are not entries, and the CRT's number parser and
+        # printf state machine stopped working (D3D then asked for a 498 MB
+        # surface). The enclosing function keeps the code it reaches; the
+        # entry keeps its own start, and the translator emits it as an alias
+        # into the enclosing function's body (discover_shared_aliases).
+        weak = {a for a, (_c, m) in self._candidates.items()
+                if m in ("seed_vtable_thunk", "imm_ref_target", "tail_jump_target")}
+        bounds = [a for a in sorted_starts if a not in weak]
+
         # Create functions
-        for idx, start_addr in enumerate(sorted_starts):
+        for start_addr in sorted_starts:
             confidence, method = self._candidates[start_addr]
 
             # Determine section
@@ -930,13 +947,11 @@ class FunctionDetector:
             sec_name = section.name if section else ""
 
             # Determine end address:
-            # Walk instructions until we hit the next function start,
+            # Walk instructions until we hit the next (non-seed) function start,
             # leave the section, or reach an unconditional terminator
             # with no fall-through.
-            if idx + 1 < len(sorted_starts):
-                next_func = sorted_starts[idx + 1]
-            else:
-                next_func = None
+            b = bisect.bisect_right(bounds, start_addr)
+            next_func = bounds[b] if b < len(bounds) else None
 
             # Section end boundary
             sec_end = None

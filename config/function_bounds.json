@@ -1,4 +1,5 @@
 [
  {"start": "0x00076640", "end": "0x0007669F", "note": "Switch function cut off at its dispatch jmp [eax*4+0x766A0] (detected end 0x76653). Cases 0x76653/57/5E/65/6C/73 were unresolved indirect targets at scene 9 (24x each, 2026-09-27). truncated_switch_scan.py."},
- {"start": "0x00084A30", "end": "0x00085810", "note": "Switch dispatch at 0x857A4 (table 0x85860) at the detected end 0x857AB; one case past the end was an orphan. truncated_switch_scan.py 2026-09-27."}
+ {"start": "0x00084A30", "end": "0x00085810", "note": "Switch dispatch at 0x857A4 (table 0x85860) at the detected end 0x857AB; one case past the end was an orphan. truncated_switch_scan.py 2026-09-27."},
+ {"start": "0x001273B0", "end": "0x001276ED", "note": "MSVC memcpy: the end walk stops at 0x127652 inside its backward-copy tail, whose switch tables (0x12750C, 0x127648) are indexed with a negative ecx and so never measure as tables; the case arms 0x12764C..0x1276EC fell outside and both switches degraded to ITAIL (gen_s22). Real end is the int3 pad at 0x1276ED. 2026-09-28."}
 ]

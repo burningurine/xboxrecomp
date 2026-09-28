@@ -107,6 +107,11 @@ def test_split_translation_passes_manual_set_to_lifter():
             self.owned_function_starts = set()
             self.lifter = Lifter()
             self.seen_manual = None
+            self.alias_host = {}
+            self.alias_failed = set()
+
+        def discover_shared_aliases(self, exclude=()):
+            pass
 
         def translate_function(self, addr, func_info):
             self.seen_manual = self.lifter.manual_functions

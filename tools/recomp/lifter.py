@@ -432,6 +432,48 @@ _EFLAGS_PRESERVE = frozenset({
 })
 
 
+# Setters whose ZF and SF both come from the result at the destination's width.
+RESULT_ZF_SETTERS = frozenset(("and", "or", "xor", "add", "sub", "inc", "dec", "neg"))
+
+
+def merge_result_flag_states(join_bb, pred_blocks, states):
+    """ZF/SF-only merge of different result-based flag setters at a join.
+
+    MSVC's signed `x % 2^n` is `and r, mask; jns L; dec r; or r, -2^n; inc r;
+    L: je/jne`: the flags at L come from `and` on one edge and `inc` on the
+    other. Both leave ZF/SF describing r, so a ZF/SF consumer can read r. CF/OF
+    differ between such setters and stay unknown. Only accepted when every
+    predecessor's flag setter is its last instruction (before a closing jump)
+    and writes the same register, and the join block reads the flags first,
+    so r still holds the result wherever it is read. The caller must not let
+    this state flow past the join block.
+    """
+    if not states or any(not s or not s[0] for s in states):
+        return None
+    first = join_bb.instructions[0] if join_bb.instructions else None
+    if first is None or not (first.is_cond_jump or first.mnemonic.startswith(("set", "cmov"))):
+        return None
+    if first.mnemonic in ("jecxz", "jcxz"):
+        return None
+    dest = None
+    for bb, (kind, ops) in zip(pred_blocks, states):
+        if kind not in RESULT_ZF_SETTERS or not ops or ops[0].type != "reg":
+            return None
+        insns = bb.instructions
+        k = len(insns) - 1
+        if k >= 0 and (insns[k].is_cond_jump or insns[k].mnemonic == "jmp"):
+            k -= 1
+        if (k < 0 or insns[k].mnemonic != kind or not insns[k].operands
+                or insns[k].operands[0].type != "reg"
+                or insns[k].operands[0].reg != ops[0].reg):
+            return None
+        if dest is None:
+            dest = ops[0]
+        elif ops[0].reg != dest.reg:
+            return None
+    return ("resjoin", [dest])
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -533,6 +575,18 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+
+    # ── join of result-based setters on one register: ZF/SF only ──
+    if flag_setter == "resjoin":
+        if jcc in ("je", "jz"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("jne", "jnz"):
+            return f"({lhs} != 0)", desc
+        if jcc == "js":
+            return f"({_sf_cast}({lhs}) < 0)", desc
+        if jcc == "jns":
+            return f"({_sf_cast}({lhs}) >= 0)", desc
+        return None
 
     # ── bsf/bsr: ZF is the only flag they define ──
     #

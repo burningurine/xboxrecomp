@@ -37,3 +37,26 @@ def test_mixed_widths_are_not_guessed():
     wide = [Operand(type='reg', reg='eax'), Operand(type='reg', reg='edx')]
     narrow = [Operand(type='reg', reg='al'), Operand(type='reg', reg='dl')]
     assert _merge_flag_states([('cmp', wide), ('cmp', narrow)]) is None
+
+
+def translate_mod_idiom(consumer_jcc):
+    # and ebp,0x800007FF; jns L; dec ebp; or ebp,0xFFFFF800; inc ebp;
+    # L: je/jne +0; ret  -- MSVC's signed `x % 2048` feeding a zero test.
+    image = (bytes.fromhex('81e5ff070080' '7908' '4d' '81cd00f8ffff' '45')
+             + bytes([consumer_jcc, 0x00]) + bytes.fromhex('c3'))
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image),
+                 '_addr': BASE, 'size': len(image)}}
+    return FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+
+
+def test_signed_mod_idiom_je_reads_result_register():
+    code = translate_mod_idiom(0x74)
+    assert '_flags' not in code.split('loc_')[-2] + code.split('loc_')[-1], code
+    assert '(ebp == 0)' in code, code
+
+
+def test_signed_mod_idiom_jne_reads_result_register():
+    code = translate_mod_idiom(0x75)
+    assert '(ebp != 0)' in code, code
