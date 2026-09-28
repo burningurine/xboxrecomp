@@ -2943,14 +2943,18 @@ static void kernel_vblank_fire(long long now)
          * claims rarely -> present isn't requesting flips (the throttle starves
          * it, an ordering problem). */
         if (getenv("RECOMP_VBLANK_DEBUG")) {
+            static unsigned n_beat, n_masked;
             n_inv++;
             if (claimed > 0) n_claim++;
             else if (claimed == 0) n_decl++;
+            if (title_beat) n_beat++;          /* reached the scene throttle's counter */
+            if (!line) n_masked++;             /* PMC_INTR_EN off: this vblank was lost */
             if (now - last_report >= 2000) {
-                fprintf(stderr, "  [VBLANK] 2s: invoked=%u claimed=%u declined=%u | frame-ctr [0x51A0A0]=%u\n",
-                        n_inv, n_claim, n_decl, (unsigned)BRIDGE_MEM32(0x0051A0A0u));
+                fprintf(stderr, "  [VBLANK] 2s: invoked=%u claimed=%u declined=%u beat=%u masked=%u"
+                        " | frame-ctr [0x51A0A0]=%u\n",
+                        n_inv, n_claim, n_decl, n_beat, n_masked, (unsigned)BRIDGE_MEM32(0x0051A0A0u));
                 fflush(stderr);
-                n_inv = n_claim = n_decl = 0;
+                n_inv = n_claim = n_decl = n_beat = n_masked = 0;
                 last_report = now;
             }
         }
