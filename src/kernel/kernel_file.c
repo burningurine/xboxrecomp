@@ -29,6 +29,9 @@
 #include <fnmatch.h>
 #endif
 
+/* Defined per backend below; NtClose drops a handle's directory search. */
+static void release_dir_context(HANDLE FileHandle);
+
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -302,6 +305,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        release_dir_context(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -605,6 +609,27 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     }
     LeaveCriticalSection(&s_dir_cs);
     return NULL;
+}
+
+/* A directory handle closed before its enumeration ran out keeps its search
+ * open; release it, or the next handle given the same value continues the old
+ * directory's listing instead of starting its own (XAPI's save lookup stops
+ * at the first match and closes, so the following U:\ scan then missed saves
+ * and created a duplicate). */
+static void release_dir_context(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == FileHandle && s_dir_contexts[i].find_handle != NULL) {
+            if (s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done = FALSE;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
 }
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
@@ -967,6 +992,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        release_dir_context(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1195,6 +1221,22 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* See the Windows backend: a handle closed mid-enumeration must not leave its
+ * DIR* for the next handle that reuses the value. */
+static void release_dir_context(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == FileHandle) {
+            if (s_dir_contexts[i].dir) closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
