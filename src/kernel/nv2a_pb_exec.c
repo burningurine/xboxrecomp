@@ -2334,6 +2334,49 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* With a renderer backend the executor keeps only what the kernel and the
+ * frame-stats overlay need. Flips and semaphores are kernel-visible and take
+ * the full path below; draws are only counted. Everything else here (vertex
+ * arrays, transform constants and programs, texture registers, inline and
+ * immediate vertex data, the DRAW_ARRAYS index expansion) exists to feed the
+ * CPU rasteriser, and cost ~8% of the pushbuffer thread at scene 9 on the
+ * RP6 for nothing. Returns 1 when the method is fully handled. */
+static uint32_t s_fast_verts;
+static int backend_fast_method(uint32_t method, uint32_t param)
+{
+    switch (method) {
+    case NV097_SET_BEGIN_END:
+        if (param) {
+            s_gpu.prim = param;
+            s_fast_verts = 0;
+        } else {
+            fs_draw(s_fast_verts);
+            s_gpu.prim = 0;
+        }
+        return 1;
+    case NV097_DRAW_ARRAYS:
+        s_fast_verts += ((param >> 24) & 0xFF) + 1;
+        return 1;
+    case NV097_ARRAY_ELEMENT16:
+        s_fast_verts += 2;
+        return 1;
+    case NV097_INLINE_ARRAY:
+        s_fast_verts++;                  /* words, as the full path counts them */
+        return 1;
+    case NV097_SET_FLIP_READ:
+    case NV097_SET_FLIP_WRITE:
+    case NV097_SET_FLIP_MODULO:
+    case NV097_FLIP_INCREMENT_WRITE:
+    case NV097_FLIP_STALL:
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+    case NV097_SET_SEMAPHORE_OFFSET:
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -2367,6 +2410,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     if (s_backend && s_backend->method)
         s_backend->method(subch, method, param);
+    if (s_backend && (subch != 0 || backend_fast_method(method, param)))
+        return;
 
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
