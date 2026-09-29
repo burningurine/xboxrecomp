@@ -603,6 +603,10 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
         if (s_dir_contexts[i].find_handle == NULL) {
             s_dir_contexts[i].file_handle = FileHandle;
             s_dir_contexts[i].first_done = FALSE;
+            /* Reserved until the search opens: a NULL find_handle marks the
+             * slot free, and a second thread creating its context before this
+             * one reaches FindFirstFileW would otherwise take the same slot. */
+            s_dir_contexts[i].find_handle = INVALID_HANDLE_VALUE;
             LeaveCriticalSection(&s_dir_cs);
             return &s_dir_contexts[i];
         }

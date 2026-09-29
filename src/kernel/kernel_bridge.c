@@ -616,11 +616,18 @@ static void bridge_NtClose(void)
         fflush(stderr);
     }
 
-    /* Close real handles but skip fake/synthetic ones */
+    /* Close real handles but skip fake/synthetic ones. Through xbox_NtClose,
+     * not a bare CloseHandle: it also drops the handle's directory search.
+     * XAPI's FindFirstFile opens a directory, asks for one name without
+     * RestartScan and closes it; a search left behind is continued by the next
+     * directory handle that gets the same value, which then finds nothing.
+     * CRI sizes every file missing from its file cache that way (Blinx's
+     * movies), so a movie read as 0 bytes and never started: the intermittent
+     * black opening movie. */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE)
-            CloseHandle(h);
+            xbox_NtClose(h);
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
