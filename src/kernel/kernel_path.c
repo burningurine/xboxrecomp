@@ -654,8 +654,10 @@ translate:
         }
 
         /* Repair component case against the real filesystem (Xbox FS is
-         * case-insensitive; ours is not). No-op when the path exists as spelled. */
-        casefold_path(host_path_buf);
+         * case-insensitive; ours is not). No-op when the path exists as spelled.
+         * A game file packed into the APK takes the archive's spelling instead. */
+        if (!xbox_zipfs_canon(host_path_buf, buf_size))
+            casefold_path(host_path_buf);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;

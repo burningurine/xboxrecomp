@@ -544,6 +544,29 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+#if !defined(_WIN32)
+/*
+ * Game files inside a zip archive (kernel_zipfs.c): on Android, the disc files
+ * packed STORED into the APK under assets/game/. Mounted once, before the
+ * guest boots; the archive then overlays host_root read-only.
+ */
+struct stat;
+int     xbox_zipfs_mount(const char *zip_path, const char *prefix, const char *host_root);
+int     xbox_zipfs_active(void);
+/* 1 = a file in the archive, 2 = a directory in it, 0 = not in it. */
+int     xbox_zipfs_stat(const char *host_path, struct stat *st);
+/* Rewrite host_path in the archive's spelling; 0 when it is not in the archive. */
+int     xbox_zipfs_canon(char *host_path, size_t n);
+/* An fd on the archive positioned at the file's data, which is bytes
+ * [*base, *base + *size) of it; a placeholder fd for a directory; -1 if absent. */
+int     xbox_zipfs_open(const char *host_path, int64_t *base, int64_t *size);
+int     xbox_zipfs_read_file(const char *host_path, void **out, size_t *out_size);
+/* Directory listing: a directory's first child node (-1 = none); each
+ * xbox_zipfs_child call returns a node's name and attributes and the next node. */
+int32_t xbox_zipfs_first_child(const char *host_dir);
+int32_t xbox_zipfs_child(int32_t node, const char **leaf, struct stat *st);
+#endif
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

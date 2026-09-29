@@ -134,6 +134,12 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
+/* A game file served from the APK: bytes [base, base + size) of fd (kind 1),
+ * or a directory that exists only in the archive (kind 2). w32_handle_slice
+ * returns the kind, 0 for an ordinary fd-backed handle. */
+HANDLE      w32_open_slice_handle(int fd, const char *host_path, int kind,
+                                  int64_t base, int64_t size);
+int         w32_handle_slice(HANDLE h, int64_t *base, int64_t *size);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);

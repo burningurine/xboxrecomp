@@ -822,6 +822,29 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    /* Game files packed into the APK (kernel_zipfs.c). The disc is read-only,
+     * so only a plain open is served from the archive; a directory comes from
+     * it when the real game directory has no such directory. */
+    {
+        struct stat zst;
+        int zk = xbox_zipfs_stat(host_path, NULL);
+        int plain = CreateDisposition == XBOX_FILE_OPEN || CreateDisposition == XBOX_FILE_OPEN_IF;
+        if ((zk == 1 && plain && !(CreateOptions & XBOX_FILE_DIRECTORY_FILE)) ||
+            (zk == 2 && stat(host_path, &zst) != 0)) {
+            int64_t base, size;
+            int zfd = xbox_zipfs_open(host_path, &base, &size);
+            if (zfd >= 0) {
+                *FileHandle = w32_open_slice_handle(zfd, host_path, zk, base, size);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = 1;     /* FILE_OPENED */
+                }
+                XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> handle=%p (APK)", host_path, *FileHandle);
+                return STATUS_SUCCESS;
+            }
+        }
+    }
+
     int fd;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
@@ -899,6 +922,45 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (fd < 0) {
         IoStatusBlock->Status = STATUS_INVALID_HANDLE;
         return STATUS_INVALID_HANDLE;
+    }
+
+    int64_t zbase, zsize;
+    int zk = w32_handle_slice(FileHandle, &zbase, &zsize);
+    if (zk) {
+        /* A file inside the APK: bytes [zbase, zbase + zsize) of the APK. The
+         * fd's own offset keeps the file position, as for a real file. */
+        int64_t pos, want;
+        size_t got = 0;
+        if (zk != 1) {
+            IoStatusBlock->Status = STATUS_INVALID_DEVICE_REQUEST;
+            IoStatusBlock->Information = 0;
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        pos = (ByteOffset && ByteOffset->QuadPart >= 0)
+            ? (int64_t)ByteOffset->QuadPart : (int64_t)lseek(fd, 0, SEEK_CUR) - zbase;
+        want = (pos < 0 || pos >= zsize) ? 0 : zsize - pos;
+        if (want > (int64_t)Length) want = (int64_t)Length;
+        while ((int64_t)got < want) {
+            ssize_t n = pread(fd, (char *)Buffer + got, (size_t)(want - (int64_t)got),
+                              (off_t)(zbase + pos + (int64_t)got));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+        if (pos >= 0) lseek(fd, (off_t)(zbase + pos + (int64_t)got), SEEK_SET);
+        IoStatusBlock->Information = (ULONG_PTR)got;
+        if (got == 0 && want > 0) {
+            XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) APK read errno=%d", FileHandle, errno);
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            return STATUS_UNSUCCESSFUL;
+        }
+        if (got == 0 && Length > 0) {
+            IoStatusBlock->Status = STATUS_END_OF_FILE;
+            return STATUS_END_OF_FILE;
+        }
+        IoStatusBlock->Status = STATUS_SUCCESS;
+        if (Event) SetEvent(Event);
+        return STATUS_SUCCESS;
     }
 
     if (ByteOffset && ByteOffset->QuadPart >= 0)
@@ -1027,9 +1089,13 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     if (fd < 0)
         return STATUS_INVALID_HANDLE;
 
+    /* A file inside the APK reports its own size and times, and positions
+     * relative to its start, not the APK's. */
+    int64_t zbase;
+    int zk = w32_handle_slice(FileHandle, &zbase, NULL);
     struct stat st;
     if (FileInformationClass != XboxFilePositionInformation) {
-        if (fstat(fd, &st) != 0)
+        if (zk ? !xbox_zipfs_stat(w32_handle_path(FileHandle), &st) : fstat(fd, &st) != 0)
             return STATUS_UNSUCCESSFUL;
     }
 
@@ -1060,7 +1126,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
             off_t pos = lseek(fd, 0, SEEK_CUR);
             if (pos < 0) return STATUS_UNSUCCESSFUL;
-            info->CurrentByteOffset.QuadPart = pos;
+            info->CurrentByteOffset.QuadPart = pos - zbase;
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_POSITION_INFORMATION);
             return STATUS_SUCCESS;
@@ -1100,7 +1166,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
-            if (lseek(fd, (off_t)info->CurrentByteOffset.QuadPart, SEEK_SET) < 0)
+            int64_t zbase;   /* a file inside the APK starts at zbase */
+            w32_handle_slice(FileHandle, &zbase, NULL);
+            if (lseek(fd, (off_t)(zbase + info->CurrentByteOffset.QuadPart), SEEK_SET) < 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1201,8 +1269,14 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
-    if (stat(host_path, &st) != 0)
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+    /* Files packed into the APK come from it; a directory from the real game
+     * directory when it has one. */
+    int zk = xbox_zipfs_stat(host_path, &st);
+    if (zk != 1) {
+        struct stat dst;
+        if (stat(host_path, &dst) == 0) st = dst;
+        else if (!zk) return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
 
     unix_to_filetime(st.st_ctime, 0, &FileInformation->CreationTime);
     unix_to_filetime(st.st_atime, 0, &FileInformation->LastAccessTime);
@@ -1214,17 +1288,34 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     return STATUS_SUCCESS;
 }
 
-/* Directory enumeration state, keyed by the directory's Nt handle. */
+/* Directory enumeration state, keyed by the directory's Nt handle.
+ *
+ * A directory can exist in the APK's packed game files (kernel_zipfs.c), on
+ * disk, or both (the game directory itself holds the packed media/ and the
+ * saves the title writes). The archive's entries are listed first, then the
+ * disk's, minus any name the archive already gave. */
 #define MAX_DIR_CONTEXTS 64
 typedef struct {
-    HANDLE handle;
-    DIR*   dir;
-    char   pattern[64];
+    HANDLE  handle;
+    int     active;
+    DIR*    dir;
+    int32_t zip_next;       /* next archive child, -1 = none left */
+    int     in_zip;         /* the directory exists in the archive */
+    char    pattern[64];
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+static void dir_context_reset(DIR_CONTEXT* ctx)
+{
+    if (ctx->dir) closedir(ctx->dir);
+    ctx->dir = NULL;
+    ctx->active = 0;
+    ctx->zip_next = -1;
+    ctx->in_zip = 0;
+}
 
 /* See the Windows backend: a handle closed mid-enumeration must not leave its
  * DIR* for the next handle that reuses the value. */
@@ -1234,8 +1325,7 @@ static void release_dir_context(HANDLE FileHandle)
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
         if (s_dir_contexts[i].handle == FileHandle) {
-            if (s_dir_contexts[i].dir) closedir(s_dir_contexts[i].dir);
-            s_dir_contexts[i].dir = NULL;
+            dir_context_reset(&s_dir_contexts[i]);
             s_dir_contexts[i].handle = NULL;
         }
     }
@@ -1270,18 +1360,23 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         if (!ctx) { LeaveCriticalSection(&s_dir_cs); return STATUS_INSUFFICIENT_RESOURCES; }
         ctx->handle = FileHandle;
         ctx->dir = NULL;
+        ctx->active = 0;
     }
 
-    if (RestartScan || ctx->dir == NULL) {
-        if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
-        const char* dpath = w32_handle_path(FileHandle);
-        if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
+    const char* dpath = w32_handle_path(FileHandle);
+    if (RestartScan || !ctx->active) {
+        dir_context_reset(ctx);
+        if (!dpath) { ctx->handle = NULL; LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
+        ctx->in_zip = xbox_zipfs_stat(dpath, NULL) == 2;
+        ctx->zip_next = ctx->in_zip ? xbox_zipfs_first_child(dpath) : -1;
         ctx->dir = opendir(dpath);
-        if (!ctx->dir) {
+        if (!ctx->dir && !ctx->in_zip) {
+            ctx->handle = NULL;
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
+        ctx->active = 1;
         if (FileName && FileName->Buffer && FileName->Length > 0) {
             USHORT n = FileName->Length;
             if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
@@ -1292,15 +1387,23 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
     }
 
-    /* Advance to the next entry matching the search pattern. */
-    struct dirent* de;
-    const char* dpath = w32_handle_path(FileHandle);
+    /* Advance to the next entry matching the search pattern: the archive's
+     * children first, then the disk's. */
+    char name[256];
     struct stat st;
     for (;;) {
-        de = readdir(ctx->dir);
+        if (ctx->zip_next >= 0) {
+            const char* leaf;
+            ctx->zip_next = xbox_zipfs_child(ctx->zip_next, &leaf, &st);
+            if (fnmatch(ctx->pattern, leaf, FNM_CASEFOLD) == 0) {
+                snprintf(name, sizeof(name), "%s", leaf);
+                break;
+            }
+            continue;
+        }
+        struct dirent* de = ctx->dir ? readdir(ctx->dir) : NULL;
         if (!de) {
-            closedir(ctx->dir);
-            ctx->dir = NULL;
+            dir_context_reset(ctx);
             ctx->handle = NULL;
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
@@ -1308,20 +1411,23 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
-        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
-            break;
+        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) != 0)
+            continue;
+        char full[MAX_PATH];
+        snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
+        if (ctx->in_zip && xbox_zipfs_stat(full, NULL))
+            continue;                      /* already listed from the archive */
+        if (stat(full, &st) != 0)
+            memset(&st, 0, sizeof(st));
+        snprintf(name, sizeof(name), "%s", de->d_name);
+        break;
     }
-
-    char full[MAX_PATH];
-    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
-    if (stat(full, &st) != 0)
-        memset(&st, 0, sizeof(st));
     LeaveCriticalSection(&s_dir_cs);
 
     PXBOX_FILE_DIRECTORY_INFORMATION entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
 
-    int name_len = (int)strlen(de->d_name);
+    int name_len = (int)strlen(name);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
     unix_to_filetime(st.st_ctime, 0, &entry->CreationTime);
@@ -1335,7 +1441,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
     if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
-        memcpy(entry->FileName, de->d_name, name_len);
+        memcpy(entry->FileName, name, name_len);
     IoStatusBlock->Status = STATUS_SUCCESS;
     IoStatusBlock->Information = header_size + name_len;
     return STATUS_SUCCESS;

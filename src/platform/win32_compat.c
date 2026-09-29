@@ -334,6 +334,12 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+    /* A game file inside the APK (kernel_zipfs.c): bytes [slice_base,
+     * slice_base + slice_size) of fd. slice_kind 1 = that file, 2 = a directory
+     * that exists only in the archive, 0 = fd is the file itself. */
+    int             slice_kind;
+    int64_t         slice_base;
+    int64_t         slice_size;
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -392,6 +398,29 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
     return (HANDLE)o;
+}
+
+HANDLE w32_open_slice_handle(int fd, const char *host_path, int kind,
+                             int64_t base, int64_t size)
+{
+    w32_object *o = (w32_object *)w32_open_handle(fd, host_path);
+    o->slice_kind = kind;
+    o->slice_base = base;
+    o->slice_size = size;
+    return (HANDLE)o;
+}
+
+int w32_handle_slice(HANDLE h, int64_t *base, int64_t *size)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o || o->kind != K_FILE || !o->slice_kind) {
+        if (base) *base = 0;
+        if (size) *size = 0;
+        return 0;
+    }
+    if (base) *base = o->slice_base;
+    if (size) *size = o->slice_size;
+    return o->slice_kind;
 }
 
 int w32_handle_fd(HANDLE h)
