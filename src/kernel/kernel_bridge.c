@@ -701,6 +701,79 @@ extern uint32_t xbox_StagingAlloc(uint32_t size, uint32_t alignment);
 extern void     xbox_StagingFree(uint32_t xbox_va);
 extern int      xbox_StagingContains(uint32_t xbox_va);
 
+/* Contiguous memory below a ceiling the arena cannot meet.
+ *
+ * The arena (xbox_ContiguousAlloc) starts above the resident image, near
+ * 50 MB on a large title, so it can never honour a caller's `high` below
+ * that. D3D asks for exactly that for its visibility-test report pages:
+ * sub_000F3D91 passes high = 0x00FFFFFF, because GET_REPORT carries a 24-bit
+ * offset and D3D forms the method as (va & 0x0EFFFFFF) | TYPE_ZPASS << 24.
+ * From the arena the page was physical 0x0365xxxx, whose bits 24-25 turned
+ * TYPE into 3; the renderer dropped every report as an unknown type, each
+ * test stayed "incomplete" and Blinx culled every monster (they are drawn
+ * only when their occlusion test saw pixels).
+ *
+ * The contiguous window's storage below the arena start is never handed out
+ * (the image lives in the RAM mapping, not there), and the GPU view and
+ * 0x80000000+P both see it, so such blocks come from there, top-down under
+ * `high`. Whole-block reuse after a free, as in the arena. */
+#define LOW_CONTIG_MAX_BLOCKS 64
+static struct { uint32_t phys, size; int used; } s_low_contig[LOW_CONTIG_MAX_BLOCKS];
+static int s_low_contig_count;
+static uint32_t s_low_contig_floor;   /* lowest physical address carved so far */
+
+static uint32_t low_contig_arena_start(void)
+{
+    return g_xbox_image_hi ? (g_xbox_image_hi + 0xFFFFu) & ~0xFFFFu : 0;
+}
+
+static uint32_t low_contig_alloc(uint32_t size, uint32_t low, uint32_t high, uint32_t align)
+{
+    uint32_t top, phys;
+    int i;
+
+    size = (size + 0xFFFu) & ~0xFFFu;
+    if (align < 4096)
+        align = 4096;
+    for (i = 0; i < s_low_contig_count; i++) {
+        if (!s_low_contig[i].used && s_low_contig[i].size == size &&
+                s_low_contig[i].phys >= low && s_low_contig[i].phys + size - 1 <= high &&
+                !(s_low_contig[i].phys & (align - 1))) {
+            s_low_contig[i].used = 1;
+            return s_low_contig[i].phys;
+        }
+    }
+    if (s_low_contig_count >= LOW_CONTIG_MAX_BLOCKS)
+        return 0;
+    top = high + 1u;
+    if (s_low_contig_floor && s_low_contig_floor < top)
+        top = s_low_contig_floor;
+    if (top < size + 0x10000u)          /* keep clear of page 0 and the first 64 KB */
+        return 0;
+    phys = (top - size) & ~(align - 1);
+    if (phys < low || phys < 0x10000u)
+        return 0;
+    s_low_contig[s_low_contig_count].phys = phys;
+    s_low_contig[s_low_contig_count].size = size;
+    s_low_contig[s_low_contig_count].used = 1;
+    s_low_contig_count++;
+    s_low_contig_floor = phys;
+    return phys;
+}
+
+static int low_contig_free(uint32_t xbox_va)
+{
+    int i;
+
+    for (i = 0; i < s_low_contig_count; i++) {
+        if (s_low_contig[i].used && XBOX_PHYSICAL_MIRROR_BASE + s_low_contig[i].phys == xbox_va) {
+            s_low_contig[i].used = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void bridge_MmAllocateContiguousMemoryEx(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -738,6 +811,27 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
         }
         g_eax = xbox_va;
         return;
+    }
+
+    /* A ceiling below the arena (see low_contig_alloc): D3D's report pages. */
+    if (high && high < 0x04000000u && low_contig_arena_start() &&
+            high < low_contig_arena_start()) {
+        uint32_t phys = low_contig_alloc(size, low, high, align);
+        if (phys) {
+            xbox_va = XBOX_PHYSICAL_MIRROR_BASE + phys;
+            memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0,
+                   (size + 0xFFFu) & ~0xFFFu);
+            if (KERNEL_LOG_ON_HALF()) {
+                fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
+                        "high=0x%08X -> low phys 0x%08X, Xbox VA 0x%08X\n",
+                        size, high, phys, xbox_va);
+                fflush(stderr);
+            }
+            g_eax = xbox_va;
+            return;
+        }
+        fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u high=0x%08X"
+                " not satisfiable below the ceiling; using the arena\n", size, high);
     }
 
     /* Split on the RAW alignment, before the 4 KB minimum below. D3DX texture
@@ -799,7 +893,7 @@ static void bridge_MmFreeContiguousMemory(void)
      * address so each one's free-list is maintained (see bridge_Mm...Ex). */
     if (xbox_StagingContains(addr))
         xbox_StagingFree(addr);
-    else
+    else if (!low_contig_free(addr))
         xbox_ContiguousFree(addr);
     g_eax = 0;
 }
