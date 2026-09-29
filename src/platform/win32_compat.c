@@ -922,6 +922,29 @@ static int64_t guest_mono_ns(void)
     return (f ? f : raw_mono_ns()) - __atomic_load_n(&s_clock_off_ns, __ATOMIC_ACQUIRE);
 }
 
+/* For the kernel's hang watchdog: is the guest frozen on purpose, and signal
+ * every live guest thread (to have each log where it is). */
+int xbox_HostFrozen(void)
+{
+#ifdef __linux__
+    return __atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST);
+#else
+    return 0;
+#endif
+}
+
+void xbox_HostSignalLiveThreads(int sig)
+{
+#ifdef __linux__
+    pthread_mutex_lock(&s_live_lock);
+    for (int i = 0; i < s_live_n; i++)
+        pthread_kill(s_live[i]->thread, sig);
+    pthread_mutex_unlock(&s_live_lock);
+#else
+    (void)sig;
+#endif
+}
+
 /* Freeze (on=1) or thaw (on=0) the guest. Called from the app's UI thread;
  * never blocks on anything a parked thread can hold. */
 void xbox_HostFreeze(int on)

@@ -1112,8 +1112,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {
@@ -2103,9 +2103,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
+        /* RECOMP_PB_EXEC no longer arms it: that is on by default on
+         * Android, and the trace wrote a log line per GPU kick (hundreds a
+         * second) through the stderr pipe. The executor runs without it. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+                    || getenv("RECOMP_PB_SCAN") != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",

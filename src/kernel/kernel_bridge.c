@@ -3557,6 +3557,120 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* Hang watchdog (Android). The timer thread is the game's clock: it delivers
+ * the vblank ISR/DPCs and logs [STATS]. If it stops completing its loop for
+ * 3 s while the guest is not frozen on purpose, every guest thread is asked
+ * (by signal) to log where it is: its native frame-pointer chain as offsets
+ * into libblinx.so (symbolize with llvm-symbolizer on the unstripped build)
+ * and the return addresses on its guest stack. Once per hang. */
+static volatile uint32_t g_timer_beat;
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <link.h>
+#include <pthread.h>
+#include <signal.h>
+#include <ucontext.h>
+extern int xbox_HostFrozen(void);
+extern void xbox_HostSignalLiveThreads(int sig);
+static uintptr_t g_hang_so_base;
+static int g_timer_tid;
+
+static int hang_find_base(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size;
+    uintptr_t me = (uintptr_t)data;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        uintptr_t lo = (uintptr_t)info->dlpi_addr + ph->p_vaddr;
+        if (ph->p_type == PT_LOAD && me >= lo && me < lo + ph->p_memsz) {
+            g_hang_so_base = (uintptr_t)info->dlpi_addr;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void hang_dump_handler(int sig, siginfo_t *si, void *uctx)
+{
+    char buf[1024];
+    int n = 0, i;
+    uintptr_t b = g_hang_so_base;
+    (void)sig; (void)si;
+    n += snprintf(buf + n, sizeof buf - n, "[HANG] tid=%d%s", (int)gettid(),
+                  (int)gettid() == g_timer_tid ? " (timer)" : "");
+#if defined(__aarch64__)
+    {
+        ucontext_t *uc = (ucontext_t *)uctx;
+        uintptr_t pc = uc->uc_mcontext.pc, lr = uc->uc_mcontext.regs[30];
+        uintptr_t fp = uc->uc_mcontext.regs[29];
+        n += snprintf(buf + n, sizeof buf - n, " pc=%zx lr=%zx fp:",
+                      (size_t)(pc - b), (size_t)(lr - b));
+        for (i = 0; i < 24 && fp && n < 760; i++) {
+            const uintptr_t *f = (const uintptr_t *)fp;
+            uintptr_t next = f[0], ra = f[1];
+            n += snprintf(buf + n, sizeof buf - n, " %zx", (size_t)(ra - b));
+            if (next <= fp || next - fp > (1u << 20)) break;
+            fp = next;
+        }
+    }
+#else
+    (void)uctx;
+#endif
+    if (g_esp) {
+        int shown = 0;
+        n += snprintf(buf + n, sizeof buf - n, " | esp=%08X:", g_esp);
+        for (i = 0; i < 200 && shown < 12 && n < 1000; i++) {
+            uint32_t w = BRIDGE_MEM32(g_esp + (uint32_t)(i * 4));
+            if (w >= 0x00012000u && w < 0x00400000u) {
+                n += snprintf(buf + n, sizeof buf - n, " %X", w);
+                shown++;
+            }
+        }
+    }
+    __android_log_write(ANDROID_LOG_WARN, "blinx-hang", buf);
+}
+
+static void *hang_watch_thread(void *arg)
+{
+    uint32_t last = g_timer_beat;
+    int still = 0, dumped = 0;
+    (void)arg;
+    for (;;) {
+        usleep(500000);
+        uint32_t beat = g_timer_beat;
+        if (beat != last || xbox_HostFrozen()) {
+            last = beat;
+            still = 0;
+            dumped = 0;
+            continue;
+        }
+        if (++still >= 6 && !dumped) {
+            dumped = 1;
+            __android_log_print(ANDROID_LOG_WARN, "blinx-hang",
+                                "[HANG] timer thread stalled 3 s (beat %u); dumping guest threads",
+                                beat);
+            xbox_HostSignalLiveThreads(SIGRTMIN + 6);
+        }
+    }
+    return NULL;
+}
+
+static void hang_watch_start(void)
+{
+    struct sigaction sa;
+    pthread_t t;
+    g_timer_tid = (int)gettid();
+    dl_iterate_phdr(hang_find_base, (void *)(uintptr_t)&hang_watch_start);
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = hang_dump_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGRTMIN + 6, &sa, NULL);
+    if (pthread_create(&t, NULL, hang_watch_thread, NULL) == 0)
+        pthread_detach(t);
+}
+#endif
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -3590,10 +3704,15 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         if (pe && atoi(pe) > 0) g_timer_slow_ms = atoi(pe);
     }
 
+#if defined(__ANDROID__)
+    hang_watch_start();
+#endif
     for (;;) {
         long long now;
         long long ts0, ts_vbl, ts_irq, ts_drain, ts_misc, ts_end;
         int i;
+
+        g_timer_beat++;
 
         {
             /* Sleep precisely to the next vblank deadline, but wake at least
