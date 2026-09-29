@@ -435,6 +435,27 @@ _EFLAGS_PRESERVE = frozenset({
 # Setters whose ZF and SF both come from the result at the destination's width.
 RESULT_ZF_SETTERS = frozenset(("and", "or", "xor", "add", "sub", "inc", "dec", "neg"))
 
+# What a result join may carry ahead of its flag reader: none of these touches
+# EFLAGS, and the join is refused if one of them writes the result register.
+_RESJOIN_PASSTHROUGH = frozenset(("mov", "movzx", "movsx", "lea", "push", "nop"))
+
+_REG_FAMILY = {reg: full for full, regs in (
+    ("eax", ("al", "ah", "ax", "eax")), ("ebx", ("bl", "bh", "bx", "ebx")),
+    ("ecx", ("cl", "ch", "cx", "ecx")), ("edx", ("dl", "dh", "dx", "edx")),
+    ("esi", ("si", "esi")), ("edi", ("di", "edi")),
+    ("ebp", ("bp", "ebp")), ("esp", ("sp", "esp"))) for reg in regs}
+
+
+def _writes_reg_family(insn, reg):
+    """Whether insn writes any part of the 32-bit register holding reg."""
+    def family(r):
+        r = str(r).lower()
+        return _REG_FAMILY.get(r, r)
+    if insn.mnemonic == "push":
+        return family(reg) == "esp"
+    ops = insn.operands
+    return bool(ops) and ops[0].type == "reg" and family(ops[0].reg) == family(reg)
+
 
 def merge_result_flag_states(join_bb, pred_blocks, states):
     """ZF/SF-only merge of different result-based flag setters at a join.
@@ -444,13 +465,19 @@ def merge_result_flag_states(join_bb, pred_blocks, states):
     other. Both leave ZF/SF describing r, so a ZF/SF consumer can read r. CF/OF
     differ between such setters and stay unknown. Only accepted when every
     predecessor's flag setter is its last instruction (before a closing jump)
-    and writes the same register, and the join block reads the flags first,
-    so r still holds the result wherever it is read. The caller must not let
-    this state flow past the join block.
+    and writes the same register, and the join block reads the flags before
+    anything writes r or the flags (plain moves and stores may come first:
+    Blinx's `add al, -6 / add al, -12; L: mov [esi+0xD], al; jns`), so r still
+    holds the result wherever it is read. The caller must not let this state
+    flow past the join block.
     """
     if not states or any(not s or not s[0] for s in states):
         return None
-    first = join_bb.instructions[0] if join_bb.instructions else None
+    join_insns = join_bb.instructions or []
+    lead = 0
+    while lead < len(join_insns) and join_insns[lead].mnemonic in _RESJOIN_PASSTHROUGH:
+        lead += 1
+    first = join_insns[lead] if lead < len(join_insns) else None
     if first is None or not (first.is_cond_jump or first.mnemonic.startswith(("set", "cmov"))):
         return None
     if first.mnemonic in ("jecxz", "jcxz"):
@@ -471,6 +498,8 @@ def merge_result_flag_states(join_bb, pred_blocks, states):
             dest = ops[0]
         elif ops[0].reg != dest.reg:
             return None
+    if any(_writes_reg_family(insn, dest.reg) for insn in join_insns[:lead]):
+        return None
     return ("resjoin", [dest])
 
 
@@ -570,11 +599,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # `test dl, dl; jns` asks about bit 7; evaluating the zero-extended byte as
     # an int32 makes 0x80..0xFF look positive and the branch always goes the
     # same way. Same defect the signed compares had before the width-aware
-    # CMP_L/CMP_G landed -- js/jns were simply missed at the time.
+    # CMP_L/CMP_G landed -- js/jns were simply missed at the time. The
+    # result-based setters below read the destination and need it too: Blinx
+    # clamps its player's byte weights with `add byte [esi+0xC], -16; jns`,
+    # and a zero-extended read never went negative, so they wrapped to 0xF0.
     _sf_width = _operand_width(flag_ops[0]) if flag_ops else None
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+    _ucast = {1: "(uint8_t)", 2: "(uint16_t)"}.get(_sf_width, "(uint32_t)")
 
     # ── join of result-based setters on one register: ZF/SF only ──
     if flag_setter == "resjoin":
@@ -665,24 +698,25 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
-            return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
+            return (f"{cmp_macro}({_ucast}((uint32_t){lhs} + (uint32_t){rhs}), "
+                    f"{_ucast}({rhs}))", desc)
         if jcc in ("jb", "jnae"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -692,21 +726,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -716,9 +750,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -728,13 +762,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         if jcc in ("jb", "jnae"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb"):
@@ -792,17 +826,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         return None
 
     # ── shift: result-based ──
@@ -812,9 +846,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -824,9 +858,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
