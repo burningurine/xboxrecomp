@@ -24,7 +24,7 @@ from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width,
-                     merge_result_flag_states)
+                     merge_result_flag_states, plan_join_snapshot)
 
 
 def _merge_flag_states(states):
@@ -49,6 +49,30 @@ def _merge_flag_states(states):
         if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
             return None
     return first
+
+
+# RECOMP_FLAG_REASONS=<file>: append one JSON line per block that falls back to
+# the never-set `_flags`, saying why its flag state was lost (a triage aid).
+_FLAG_REASONS = os.environ.get("RECOMP_FLAG_REASONS")
+
+
+def _log_flag_reason(start, bb, incoming, sources, missing):
+    if incoming is not None:
+        why = "in-block"            # a setter or jcc the lifter cannot pair
+    elif bb.start == start:
+        why = "entry"
+    elif not sources:
+        why = "no-preds"
+    elif bb.start in missing:
+        why = "back-edge"
+    else:
+        why = "unmergeable"
+    first = bb.instructions[0] if bb.instructions else None
+    rec = {"func": f"0x{start:08X}", "block": f"0x{bb.start:08X}", "why": why,
+           "first": first.mnemonic if first else None,
+           "preds": [f"0x{p:08X}" for p in sorted(sources)]}
+    with open(_FLAG_REASONS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
 
 
 def write_if_changed(path, text):
@@ -806,6 +830,87 @@ class FunctionTranslator:
         return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
+    def _lift_flow(self, start, blocks, preds, block_at, prior_out):
+        """One pass over the blocks in address order, threading flag state.
+
+        prior_out: the previous pass's out states, used for predecessors this
+        pass has not lifted yet (back edges); None on the first pass.
+        """
+        out, block_in, stmts_of, missing = {}, {}, {}, set()
+        jsnap_at = set()
+        next_of = {b.start: n for b, n in zip(blocks, blocks[1:])}
+
+        def chain(bb):
+            """bb's fall-through successors that only bb reaches (a join's
+            flag reader may sit a block or two further on)."""
+            found = []
+            while len(found) < 3:
+                last = bb.instructions[-1] if bb.instructions else None
+                if last is None or last.is_cond_jump or last.is_ret or last.is_call:
+                    break
+                if last.mnemonic == "jmp":
+                    nxt = block_at.get(last.jump_target)
+                elif last.mnemonic in ("int3", "ud2", "hlt"):
+                    break
+                else:
+                    nxt = next_of.get(bb.start)
+                if nxt is None or preds[nxt.start] != {bb.start}:
+                    break
+                found.append(nxt)
+                bb = nxt
+            return found
+
+        for bb in blocks:
+            # Inherit agreed state, including compatible CMP/TEST snapshots
+            # whose source operands differ between predecessor paths.
+            sources = preds[bb.start]
+            incoming = None
+            # An alias entry is also reached from the entry switch, which
+            # brings the flags of whoever called it; no calling convention
+            # defines those, so the block's own predecessors decide. Dropping
+            # the state there instead broke `cmp; mov; <alias>: je`, which the
+            # PLL clock code in D3D (0x13FF73) uses to skip a divide by zero.
+            if bb.start != start and sources:
+                known = {p: out[p] if p in out else prior_out[p]
+                         for p in sources
+                         if p in out or (prior_out is not None and p in prior_out)}
+                if len(known) < len(sources):
+                    missing.add(bb.start)
+                else:
+                    order = sorted(sources)
+                    states = [known[p] for p in order]
+                    incoming = _merge_flag_states(states)
+                    if incoming is None:
+                        incoming = merge_result_flag_states(
+                            bb, [block_at[p] for p in order], states)
+                    if incoming is None:
+                        plan = plan_join_snapshot(bb, [block_at[p] for p in order], states,
+                                                  chain(bb))
+                        if plan:
+                            incoming, setters = plan
+                            jsnap_at.update(setters)
+                            # Predecessors lifted already get their snapshot
+                            # now; later ones (back edges) when lifted.
+                            for p in order:
+                                if p in stmts_of:
+                                    stmts_of[p], _st = lift_basic_block(
+                                        self.lifter, block_at[p],
+                                        flag_state=block_in[p], jsnap_at=jsnap_at)
+            block_in[bb.start] = incoming
+            stmts, st = lift_basic_block(self.lifter, bb, flag_state=incoming,
+                                         jsnap_at=jsnap_at)
+            # A register-read join state is only valid where the join block
+            # consumes it first; later blocks may see the register rewritten.
+            # A join snapshot stays valid until the next flag setter, which
+            # replaces the state anyway, so it flows on (a merge with any other
+            # state refuses it).
+            if st and st[0] == "resjoin":
+                st = None
+            out[bb.start] = st
+            stmts_of[bb.start] = stmts
+        return {"out": out, "in": block_in, "stmts": stmts_of,
+                "missing": missing, "gap": bool(missing), "jsnap": bool(jsnap_at)}
+
     def translate_function(self, func_addr, func_info):
         """
         Translate a single function to C code.
@@ -1219,8 +1324,30 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
-        out_state = {}
+        # Flag state follows control flow. A pass walks the blocks in address
+        # order, so a back edge's predecessor is not lifted yet; when a pass
+        # meets one, another pass takes that predecessor's state from the
+        # previous one, until the states stop changing (a fixpoint, so every
+        # join saw its predecessors' final states). Without one, the first
+        # pass stands and back edges stay unknown.
+        flow = self._lift_flow(start, blocks, preds, block_at, None)
+        if flow["gap"]:
+            prior = flow["out"]
+            for _ in range(3):
+                nxt = self._lift_flow(start, blocks, preds, block_at, prior)
+                if nxt["out"] == prior:
+                    flow = nxt
+                    break
+                prior = nxt["out"]
+        if flow["jsnap"]:
+            # A snapshot join always has its jcc, so `_flags` is declared.
+            decl = next(k for k, l in enumerate(lines) if l.startswith("    int _flags = 0;"))
+            lines.insert(decl + 1, "    uint32_t _ja = 0, _jb = 0; int32_t _jas = 0, _jbs = 0;"
+                                   " /* join snapshot */")
+            lines.insert(decl + 2, "    (void)_ja; (void)_jb; (void)_jas; (void)_jbs;")
+
         for bb in blocks:
+            stmts = flow["stmts"][bb.start]
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
                 # The trailing ';' is load-bearing: C requires a statement after
@@ -1229,36 +1356,9 @@ class FunctionTranslator:
                 # otherwise produce `loc_X:` immediately before `}` and fail to
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
-
-            # Inherit agreed state, including compatible CMP/TEST snapshots
-            # whose source operands differ between predecessor paths.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing at which operation produced the runtime flags.
-            sources = preds[bb.start]
-            # An alias entry is also reached from the entry switch, which
-            # brings the flags of whoever called it; no calling convention
-            # defines those, so the block's own predecessors decide. Dropping
-            # the state there instead broke `cmp; mov; <alias>: je`, which the
-            # PLL clock code in D3D (0x13FF73) uses to skip a divide by zero.
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = _merge_flag_states(states)
-                if incoming is None:
-                    incoming = merge_result_flag_states(
-                        bb, [block_at[p] for p in sorted(sources)],
-                        [out_state[p] for p in sorted(sources)])
-            else:
-                incoming = None
-
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
-            # A register-read join state is only valid where the join block
-            # consumes it first; later blocks may see the register rewritten.
-            if out_state[bb.start] and out_state[bb.start][0] == "resjoin":
-                out_state[bb.start] = None
+            if _FLAG_REASONS and any("(_flags" in s for s in stmts):
+                _log_flag_reason(start, bb, flow["in"][bb.start], preds[bb.start],
+                                 flow["missing"])
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 

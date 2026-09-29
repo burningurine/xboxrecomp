@@ -100,6 +100,49 @@ def test_result_join_refused_when_the_result_is_overwritten():
     assert '((int8_t)(LO8(eax)) >= 0)' not in code, code
 
 
+
+def test_join_snapshot_signed_mod_idiom():
+    # and eax,0x80000001; jns L; dec; or eax,-2; inc; L: mov eax,[esi+0x10];
+    # je -- MSVC's `rand() % 2 == 0`. The join rewrites eax before the je, so
+    # each edge snapshots its result and the je reads the snapshot.
+    code = translate(bytes.fromhex('2501000080' '7905' '48' '83c8fe' '40'
+                                   '8b4610' '7402' '33c0' 'c3'))
+    assert 'if (CMP_EQ(_ja, _jb))' in code, code
+    assert 'if (_flags' not in code, code
+    assert code.count('join snapshot */') == 3, code   # decl + two setters
+
+
+def test_join_snapshot_cmp_test_signed():
+    # cmp word [esi+0xA],0 on one edge, test cx,cx on the other, then jge.
+    code = translate(bytes.fromhex('85c07407' '66837e0a00' 'eb03' '6685c9'
+                                   '7d01' '90' 'c3'))
+    assert 'if (CMP_GE(_jas, _jbs))' in code, code
+    assert 'if (_flags' not in code, code
+
+
+def test_join_snapshot_never_claims_carry_after_dec():
+    # cmp on one edge, dec on the other, then jb: dec leaves CF alone, so no
+    # snapshot pair can stand for it (the runtime _cf still can).
+    code = translate(bytes.fromhex('85c07404' '39d8' 'eb01' '49' '7201' '90' 'c3'))
+    assert '_ja' not in code, code
+
+
+def test_join_snapshot_needs_a_setter_in_every_predecessor():
+    # One edge only passes the entry block's cmp through (mov edx,[esi]); that
+    # join keeps the fallback rather than half a snapshot.
+    code = translate(bytes.fromhex('39d8' '7404' '8b16' 'eb03' '83e001' '7401'
+                                   '90' 'c3'))
+    assert 'if (_flags /* je' in code, code
+    assert '_ja' not in code, code
+
+
+def test_back_edge_join_after_fixpoint():
+    # test ecx,ecx; L: jz done; inc eax; dec ecx; jmp L -- the loop head reads
+    # the entry test or the body's dec; a second pass supplies the back edge.
+    code = translate(bytes.fromhex('85c9' '7404' '40' '49' 'ebfa' 'c3'))
+    assert 'if (CMP_EQ(_ja, _jb))' in code, code
+    assert 'if (_flags' not in code, code
+
 if __name__ == '__main__':
     for _name, _fn in sorted(globals().items()):
         if _name.startswith('test_') and callable(_fn):
