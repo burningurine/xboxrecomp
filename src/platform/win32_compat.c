@@ -31,6 +31,7 @@
 #include <sys/mman.h>
 #if defined(__linux__)
 #include <link.h>        /* dl_iterate_phdr: our own code segment */
+#include <dlfcn.h>       /* dladdr: where a thread the freeze cannot park is */
 #include <ucontext.h>    /* the interrupted PC in the suspend/freeze handlers */
 #endif
 #if defined(__APPLE__)
@@ -308,6 +309,16 @@ typedef struct w32_object {
     volatile sig_atomic_t sig_parked;
     /* Parked by a host freeze (xbox_HostFreeze). */
     volatile sig_atomic_t host_frozen;
+    /* A thread the freeze cannot park because it keeps running outside this
+     * library: where the last freeze signal found it (pc, lr and a few frame
+     * pointer return addresses), how long it has been busy there, and whether
+     * the freeze controller has decided to park it anyway (freeze_ctl_thread). */
+    volatile uintptr_t freeze_pc, freeze_lr, freeze_bt[6];
+    volatile sig_atomic_t force_park;
+    int             busy_ticks;
+    int64_t         cpu_ns_last;
+    pid_t           os_tid;
+    uintptr_t       stk_lo, stk_hi;
     /* Depth of guest kernel calls in progress (xbox_ThreadKernelEnter). */
     volatile int    in_kcall;
     LPTHREAD_START_ROUTINE start;
@@ -861,7 +872,8 @@ static void w32_resume_handler(int sig) { (void)sig; }  /* just interrupts sigsu
  * A thread is parked only when the signal lands in this library's own code. In
  * libc or a driver it may hold a lock the UI or binder threads need (malloc,
  * the GPU driver), so it is left to run and signalled again every 20 ms until
- * it is back in our code. A thread blocked in a wait just stays blocked. */
+ * it is back in our code. A thread blocked in a wait just stays blocked. One
+ * that stays busy out there for 2 s is parked where it is (FREEZE_FORCE_TICKS). */
 #define W32_LIVE_MAX 256
 static pthread_mutex_t s_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static w32_object *s_live[W32_LIVE_MAX];
@@ -905,7 +917,26 @@ static void w32_freeze_handler(int sig, siginfo_t *si, void *uctx)
     (void)uctx;
 #endif
     if (o && __atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST)
-        && (!s_code_hi || (pc >= s_code_lo && pc < s_code_hi))) {
+        && s_code_hi && (pc < s_code_lo || pc >= s_code_hi) && !o->force_park) {
+        /* Outside our code: left running (see above). Note where, for
+         * freeze_ctl_thread's report if it stays busy out there. */
+        o->freeze_pc = pc;
+#if defined(__aarch64__)
+        {
+            const mcontext_t *m = &((ucontext_t *)uctx)->uc_mcontext;
+            uintptr_t fp = (uintptr_t)m->regs[29];
+            o->freeze_lr = (uintptr_t)m->regs[30];
+            for (int i = 0; i < 6; i++) {
+                uintptr_t ret = 0;
+                if (fp >= o->stk_lo && fp + 16 <= o->stk_hi && !(fp & 7)) {
+                    ret = ((const uintptr_t *)fp)[1];
+                    fp = ((const uintptr_t *)fp)[0];
+                }
+                o->freeze_bt[i] = ret;
+            }
+        }
+#endif
+    } else if (o && __atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST)) {
         sigset_t wait_mask;
         sigfillset(&wait_mask);
         sigdelset(&wait_mask, w32_sig_thaw());      /* only THAW may wake us */
@@ -934,16 +965,80 @@ static int find_code_segment(struct dl_phdr_info *info, size_t size, void *data)
     return 0;
 }
 
+static int64_t thread_cpu_ns(pthread_t t)
+{
+    clockid_t cid;
+    struct timespec ts;
+    if (pthread_getcpuclockid(t, &cid) != 0 || clock_gettime(cid, &ts) != 0)
+        return -1;
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* A thread still running outside our code this long into a freeze, busy the
+ * whole time, is spinning on something the freeze itself stopped (a GPU or
+ * display wait that only completes once the app is back): it would keep a
+ * core at 100% for as long as the app sits in the background. It is parked
+ * wherever it is: whatever lock it holds it holds anyway while it spins, and
+ * the thaw resumes it where it stopped, like every other thread. Seen once on
+ * the RP6 (1.0.1): the pushbuffer thread spun a core for minutes after Home. */
+#define FREEZE_FORCE_TICKS 100          /* x 20 ms */
+
+static void report_forced_park(pid_t tid, uintptr_t pc, uintptr_t lr, const uintptr_t *bt)
+{
+    char line[1024];
+    int k = snprintf(line, sizeof line,
+                     "  [FREEZE] tid %d stayed busy outside the game code for 2 s while "
+                     "paused; parking it there. pc/lr/frames:", (int)tid);
+    uintptr_t at[8] = { pc, lr, bt[0], bt[1], bt[2], bt[3], bt[4], bt[5] };
+    for (int i = 0; i < 8 && k < (int)sizeof line - 96; i++) {
+        Dl_info di;
+        if (!at[i]) continue;
+        if (dladdr((void *)at[i], &di) && di.dli_fname) {
+            const char *base = strrchr(di.dli_fname, '/');
+            k += snprintf(line + k, sizeof line - k, " %s+0x%lx%s%s", base ? base + 1 : di.dli_fname,
+                          (unsigned long)(at[i] - (uintptr_t)di.dli_fbase),
+                          di.dli_sname ? ":" : "", di.dli_sname ? di.dli_sname : "");
+        } else {
+            k += snprintf(line + k, sizeof line - k, " 0x%lx", (unsigned long)at[i]);
+        }
+    }
+    fprintf(stderr, "%s\n", line);
+    fflush(stderr);
+}
+
 static void *freeze_ctl_thread(void *arg)
 {
     (void)arg;
     for (;;) {
+        struct { pid_t tid; uintptr_t pc, lr, bt[6]; } rep[4];
+        int nrep = 0;
         pthread_mutex_lock(&s_live_lock);
         if (__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST))
-            for (int i = 0; i < s_live_n; i++)
-                if (!s_live[i]->host_frozen && !s_live[i]->sig_parked)
-                    pthread_kill(s_live[i]->thread, w32_sig_freeze());
+            for (int i = 0; i < s_live_n; i++) {
+                w32_object *o = s_live[i];
+                if (o->host_frozen || o->sig_parked)
+                    continue;
+                /* Busy: more than half of the last tick on a CPU. */
+                int64_t cpu = thread_cpu_ns(o->thread);
+                int busy = cpu >= 0 && o->cpu_ns_last > 0 && cpu - o->cpu_ns_last > 10000000;
+                o->cpu_ns_last = cpu;
+                o->busy_ticks = busy ? o->busy_ticks + 1 : 0;
+                if (o->busy_ticks == FREEZE_FORCE_TICKS && !o->force_park) {
+                    if (nrep < 4) {
+                        rep[nrep].tid = o->os_tid;
+                        rep[nrep].pc = o->freeze_pc;
+                        rep[nrep].lr = o->freeze_lr;
+                        memcpy(rep[nrep].bt, (const void *)o->freeze_bt, sizeof rep[nrep].bt);
+                        nrep++;
+                    }
+                    o->force_park = 1;
+                }
+                pthread_kill(o->thread, w32_sig_freeze());
+            }
         pthread_mutex_unlock(&s_live_lock);
+        /* Outside the lock: dladdr and stdio take locks the spinner may hold. */
+        for (int i = 0; i < nrep; i++)
+            report_forced_park(rep[i].tid, rep[i].pc, rep[i].lr, rep[i].bt);
         usleep(20000);
     }
     return NULL;
@@ -1072,6 +1167,11 @@ void xbox_HostFreeze(int on)
     pthread_mutex_lock(&s_live_lock);
     if (on && !s_host_frozen) {
         __atomic_store_n(&s_clock_frozen_at, raw_mono_ns(), __ATOMIC_RELEASE);
+        for (int i = 0; i < s_live_n; i++) {
+            s_live[i]->force_park = 0;
+            s_live[i]->busy_ticks = 0;
+            s_live[i]->cpu_ns_last = 0;
+        }
         __atomic_store_n(&s_host_frozen, 1, __ATOMIC_SEQ_CST);
         for (int i = 0; i < s_live_n; i++)
             pthread_kill(s_live[i]->thread, w32_sig_freeze());
@@ -1080,9 +1180,11 @@ void xbox_HostFreeze(int on)
         int64_t f = s_clock_frozen_at;
         __atomic_store_n(&s_clock_off_ns, s_clock_off_ns + (raw_mono_ns() - f), __ATOMIC_RELEASE);
         __atomic_store_n(&s_clock_frozen_at, 0, __ATOMIC_RELEASE);
-        for (int i = 0; i < s_live_n; i++)
+        for (int i = 0; i < s_live_n; i++) {
+            s_live[i]->force_park = 0;
             if (s_live[i]->host_frozen)
                 pthread_kill(s_live[i]->thread, w32_sig_thaw());
+        }
     }
     pthread_mutex_unlock(&s_live_lock);
 #else
@@ -1123,6 +1225,19 @@ static void *thread_trampoline(void *arg)
     t_self_obj = o;
     t_tid      = o->tid;
 #ifdef __linux__
+    o->os_tid = gettid();
+    {   /* stack bounds, for the freeze handler's frame-pointer walk */
+        pthread_attr_t a;
+        void *lo;
+        size_t sz;
+        if (pthread_getattr_np(pthread_self(), &a) == 0) {
+            if (pthread_attr_getstack(&a, &lo, &sz) == 0) {
+                o->stk_lo = (uintptr_t)lo;
+                o->stk_hi = (uintptr_t)lo + sz;
+            }
+            pthread_attr_destroy(&a);
+        }
+    }
     live_update(o, 1);
 #endif
 
