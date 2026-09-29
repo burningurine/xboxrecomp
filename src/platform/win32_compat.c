@@ -302,6 +302,8 @@ typedef struct w32_object {
      * suspender the target is actually parked in the handler. */
     volatile sig_atomic_t sig_park_req;
     volatile sig_atomic_t sig_parked;
+    /* Parked by a host freeze (xbox_HostFreeze). */
+    volatile sig_atomic_t host_frozen;
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
@@ -785,6 +787,188 @@ static void w32_suspend_handler(int sig)
 }
 static void w32_resume_handler(int sig) { (void)sig; }  /* just interrupts sigsuspend */
 
+/* Host freeze: stop the whole guest while the app is in the background or its
+ * own menu is open (xbox_HostFreeze). Every live CreateThread thread -- the
+ * title's threads and the kernel timer/interrupt thread -- parks in a signal
+ * handler until thawed, and the guest clocks (GetTickCount*,
+ * QueryPerformanceCounter) stand still, so the title sees no time pass.
+ *
+ * A thread is parked only when the signal lands in this library's own code. In
+ * libc or a driver it may hold a lock the UI or binder threads need (malloc,
+ * the GPU driver), so it is left to run and signalled again every 20 ms until
+ * it is back in our code. A thread blocked in a wait just stays blocked. */
+#include <link.h>
+#include <ucontext.h>
+
+#define W32_LIVE_MAX 256
+static pthread_mutex_t s_live_lock = PTHREAD_MUTEX_INITIALIZER;
+static w32_object *s_live[W32_LIVE_MAX];
+static int s_live_n;
+static volatile int s_host_frozen;
+static uintptr_t s_code_lo, s_code_hi;    /* this library's executable segment */
+
+static int w32_sig_freeze(void) { return SIGRTMIN + 4; }
+static int w32_sig_thaw(void)   { return SIGRTMIN + 5; }
+
+/* List updates run with the freeze signal blocked, so a thread is never parked
+ * holding s_live_lock (the freeze and thaw paths take it). */
+static void live_update(w32_object *o, int add)
+{
+    sigset_t blk, old;
+    sigemptyset(&blk);
+    sigaddset(&blk, w32_sig_freeze());
+    pthread_sigmask(SIG_BLOCK, &blk, &old);
+    pthread_mutex_lock(&s_live_lock);
+    if (add) {
+        if (s_live_n < W32_LIVE_MAX) s_live[s_live_n++] = o;
+    } else {
+        for (int i = 0; i < s_live_n; i++)
+            if (s_live[i] == o) { s_live[i] = s_live[--s_live_n]; break; }
+    }
+    pthread_mutex_unlock(&s_live_lock);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+static void w32_freeze_handler(int sig, siginfo_t *si, void *uctx)
+{
+    (void)sig; (void)si;
+    int saved = errno;
+    w32_object *o = t_self_obj;
+    uintptr_t pc = 0;
+#if defined(__aarch64__)
+    pc = (uintptr_t)((ucontext_t *)uctx)->uc_mcontext.pc;
+#elif defined(__x86_64__)
+    pc = (uintptr_t)((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
+#else
+    (void)uctx;
+#endif
+    if (o && __atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST)
+        && (!s_code_hi || (pc >= s_code_lo && pc < s_code_hi))) {
+        sigset_t wait_mask;
+        sigfillset(&wait_mask);
+        sigdelset(&wait_mask, w32_sig_thaw());      /* only THAW may wake us */
+        __atomic_store_n(&o->host_frozen, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST))
+            sigsuspend(&wait_mask);
+        __atomic_store_n(&o->host_frozen, 0, __ATOMIC_SEQ_CST);
+    }
+    errno = saved;
+}
+
+static int find_code_segment(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size;
+    uintptr_t me = (uintptr_t)data;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X)) continue;
+        uintptr_t lo = (uintptr_t)info->dlpi_addr + ph->p_vaddr;
+        if (me >= lo && me < lo + ph->p_memsz) {
+            s_code_lo = lo;
+            s_code_hi = lo + ph->p_memsz;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void *freeze_ctl_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&s_live_lock);
+        if (__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST))
+            for (int i = 0; i < s_live_n; i++)
+                if (!s_live[i]->host_frozen)
+                    pthread_kill(s_live[i]->thread, w32_sig_freeze());
+        pthread_mutex_unlock(&s_live_lock);
+        usleep(20000);
+    }
+    return NULL;
+}
+#endif /* __linux__ */
+
+/* Cooperative freeze point, in Sleep and SwitchToThread: a thread looping on
+ * those spends nearly all its time in the kernel, so the freeze signal almost
+ * always lands in libc and never parks it (the NV2A interrupt reflector spins
+ * on SwitchToThread while a vblank is in service). Called from our own code,
+ * it holds no libc lock, so it parks here instead. */
+static void w32_freeze_point(void)
+{
+#ifdef __linux__
+    w32_object *o = t_self_obj;
+    if (!o || !__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST)) return;
+    __atomic_store_n(&o->host_frozen, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST))
+        usleep(10000);                     /* THAW's signal cuts this short */
+    __atomic_store_n(&o->host_frozen, 0, __ATOMIC_SEQ_CST);
+#endif
+}
+
+/* Guest clocks: CLOCK_MONOTONIC minus the time spent frozen. */
+static volatile int64_t s_clock_off_ns;
+static volatile int64_t s_clock_frozen_at;   /* raw time the freeze began, 0 = running */
+
+static int64_t raw_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static int64_t guest_mono_ns(void)
+{
+    int64_t f = __atomic_load_n(&s_clock_frozen_at, __ATOMIC_ACQUIRE);
+    return (f ? f : raw_mono_ns()) - __atomic_load_n(&s_clock_off_ns, __ATOMIC_ACQUIRE);
+}
+
+/* Freeze (on=1) or thaw (on=0) the guest. Called from the app's UI thread;
+ * never blocks on anything a parked thread can hold. */
+void xbox_HostFreeze(int on)
+{
+#ifdef __linux__
+    static int init;
+    if (!init) {
+        init = 1;
+        dl_iterate_phdr(find_code_segment, (void *)(uintptr_t)&xbox_HostFreeze);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = w32_freeze_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigfillset(&sa.sa_mask);
+        sigaction(w32_sig_freeze(), &sa, NULL);
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = w32_resume_handler;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(w32_sig_thaw(), &sa, NULL);
+        pthread_t t;
+        pthread_create(&t, NULL, freeze_ctl_thread, NULL);
+        pthread_detach(t);
+    }
+    pthread_mutex_lock(&s_live_lock);
+    if (on && !s_host_frozen) {
+        __atomic_store_n(&s_clock_frozen_at, raw_mono_ns(), __ATOMIC_RELEASE);
+        __atomic_store_n(&s_host_frozen, 1, __ATOMIC_SEQ_CST);
+        for (int i = 0; i < s_live_n; i++)
+            pthread_kill(s_live[i]->thread, w32_sig_freeze());
+    } else if (!on && s_host_frozen) {
+        __atomic_store_n(&s_host_frozen, 0, __ATOMIC_SEQ_CST);
+        int64_t f = s_clock_frozen_at;
+        __atomic_store_n(&s_clock_off_ns, s_clock_off_ns + (raw_mono_ns() - f), __ATOMIC_RELEASE);
+        __atomic_store_n(&s_clock_frozen_at, 0, __ATOMIC_RELEASE);
+        for (int i = 0; i < s_live_n; i++)
+            if (s_live[i]->host_frozen)
+                pthread_kill(s_live[i]->thread, w32_sig_thaw());
+    }
+    pthread_mutex_unlock(&s_live_lock);
+#else
+    (void)on;
+#endif
+}
+
+#ifdef __linux__
+
 static void w32_ensure_suspend_signals(void)
 {
     static int done = 0;
@@ -812,6 +996,9 @@ static void *thread_trampoline(void *arg)
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+#ifdef __linux__
+    live_update(o, 1);
+#endif
 
     /* Diagnostic (RECOMP_THREAD_LOG): confirm every pthread actually starts and
      * runs its start routine on Android. Guest worker threads spawn through here
@@ -831,6 +1018,9 @@ static void *thread_trampoline(void *arg)
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
 
+#ifdef __linux__
+    live_update(o, 0);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = rc;
     o->exited    = 1;
@@ -877,6 +1067,9 @@ VOID ExitThread(DWORD exitCode)
 {
     w32_object *o = t_self_obj;
     if (o) {
+#ifdef __linux__
+        live_update(o, 0);
+#endif
         pthread_mutex_lock(&o->lock);
         o->exit_code = exitCode;
         o->exited    = 1;
@@ -1017,7 +1210,7 @@ int GetThreadPriority(HANDLE h)
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
-VOID SwitchToThread(void) { sched_yield(); }
+VOID SwitchToThread(void) { w32_freeze_point(); sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
@@ -1041,6 +1234,7 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 
 VOID Sleep(DWORD ms)
 {
+    w32_freeze_point();
     if (ms == 0) { sched_yield(); return; }
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
@@ -1361,18 +1555,14 @@ VOID GetLocalTime(LPSYSTEMTIME st)
 
 ULONGLONG GetTickCount64(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)ts.tv_nsec / 1000000ULL;
+    return (ULONGLONG)guest_mono_ns() / 1000000ULL;   /* stands still while frozen */
 }
 
 DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    count->QuadPart = (LONGLONG)guest_mono_ns();      /* stands still while frozen */
     return TRUE;
 }
 
