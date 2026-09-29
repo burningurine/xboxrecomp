@@ -368,6 +368,14 @@ _FLAGS_UNDEFINED = frozenset({
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
+# x87 instructions that write EFLAGS (the rest only touch the FPU status word).
+_X87_EFLAGS_WRITERS = frozenset(("fcomi", "fcomip", "fucomi", "fucomip", "fcompi", "fucompi"))
+
+
+def _x87_keeps_eflags(m):
+    return m.startswith("f") and m not in _X87_EFLAGS_WRITERS
+
+
 _EFLAGS_PRESERVE = frozenset({
     # General-purpose data movement / stack
     "mov", "lea", "push", "pop", "nop", "leave", "ret",
@@ -3602,11 +3610,15 @@ def lift_basic_block(lifter, bb, flag_state=None, jsnap_at=None):
 
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
-        # instructions (e.g. neg eax; push edi; sbb eax, eax).
+        # instructions (e.g. neg eax; push edi; sbb eax, eax). x87 arithmetic
+        # leaves EFLAGS alone too: MSVC schedules fild/fmul/fstp between the
+        # pair (monster draw 0x13600: neg bl; ...; fild; fmul; sbb ebx, ebx),
+        # and stopping there dropped the carry, so sbb read a stale _cf.
         if curr.mnemonic == "neg":
             j = i + 1
             while (j < len(insns)
-                    and insns[j].mnemonic in _EFLAGS_PRESERVE
+                    and (insns[j].mnemonic in _EFLAGS_PRESERVE
+                         or _x87_keeps_eflags(insns[j].mnemonic))
                     and insns[j].mnemonic != "popfd"
                     and not insns[j].is_branch
                     and not insns[j].is_call

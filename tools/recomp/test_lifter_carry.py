@@ -25,6 +25,25 @@ class CarryLifterTest(unittest.TestCase):
             generated,
         )
 
+    def test_neg_carry_survives_x87_instructions(self):
+        # Monster draw 0x13600: neg bl; ...; fild; fmul; sbb ebx, ebx.
+        # x87 arithmetic leaves EFLAGS alone, so sbb still wants neg's carry.
+        neg = Instruction(0, 2, "neg", "ebx", "f7db")
+        neg.operands = [Operand(type="reg", reg="ebx")]
+        fchs = Instruction(2, 2, "fchs", "", "d9e0")
+        fchs.operands = []
+        sbb = Instruction(4, 2, "sbb", "ebx, ebx", "19db")
+        sbb.operands = [
+            Operand(type="reg", reg="ebx"),
+            Operand(type="reg", reg="ebx"),
+        ]
+
+        lifted, _ = lift_basic_block(
+            Lifter(), BasicBlock(start=0, instructions=[neg, fchs, sbb]))
+        generated = "\n".join(lifted)
+
+        self.assertIn("_cf = (int)((ebx) != 0);", generated)
+
     def test_cmp_sets_carry_for_a_following_sbb(self):
         # MSVC's branchless tolower inside _stricmp:
         #     sub al, 0x41 ; cmp al, 0x1A ; sbb cl, cl ; and cl, 0x20
