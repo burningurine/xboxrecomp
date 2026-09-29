@@ -29,6 +29,10 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__linux__)
+#include <link.h>        /* dl_iterate_phdr: our own code segment */
+#include <ucontext.h>    /* the interrupted PC in the suspend/freeze handlers */
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -304,6 +308,8 @@ typedef struct w32_object {
     volatile sig_atomic_t sig_parked;
     /* Parked by a host freeze (xbox_HostFreeze). */
     volatile sig_atomic_t host_frozen;
+    /* Depth of guest kernel calls in progress (xbox_ThreadKernelEnter). */
+    volatile int    in_kcall;
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
@@ -769,20 +775,50 @@ static int w32_sig_suspend(void)
 }
 static int w32_sig_resume(void) { return w32_sig_suspend() + 1; }
 
-static void w32_suspend_handler(int sig)
+/* The generated guest code's address range (xbox_SetGuestCodeRange). A thread
+ * interrupted there holds no host lock, so it may be parked on the spot; one
+ * interrupted in host code (a kernel call, libc, the renderer) may hold a lock
+ * a running thread needs -- the kernel timer thread blocked behind a parked
+ * CRI counter thread and froze the whole game once -- so it parks at its next
+ * safe point instead (w32_freeze_point). Unset = park anywhere (old behaviour). */
+static uintptr_t s_guest_lo, s_guest_hi;
+
+/* Park until ResumeThread clears the request. RESUME and SUSPEND are blocked
+ * around the check, and sigsuspend unblocks RESUME atomically, so a resume
+ * that lands between the check and the wait is not lost. */
+static void w32_park_for_suspend(w32_object *o)
 {
-    (void)sig;
+    sigset_t blk, old, wait_mask;
+    sigemptyset(&blk);
+    sigaddset(&blk, w32_sig_resume());
+    sigaddset(&blk, w32_sig_suspend());
+    pthread_sigmask(SIG_BLOCK, &blk, &old);
+    wait_mask = old;
+    sigaddset(&wait_mask, w32_sig_suspend());
+    sigdelset(&wait_mask, w32_sig_resume());        /* only RESUME may wake us */
+    o->sig_parked = 1;
+    while (o->sig_park_req)
+        sigsuspend(&wait_mask);                     /* atomic unblock+wait */
+    o->sig_parked = 0;
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+static void w32_suspend_handler(int sig, siginfo_t *si, void *uctx)
+{
+    (void)sig; (void)si;
     int saved = errno;
     w32_object *o = t_self_obj;
-    if (o) {
-        sigset_t wait_mask;
-        sigfillset(&wait_mask);
-        sigdelset(&wait_mask, w32_sig_resume());   /* only RESUME may wake us */
-        o->sig_parked = 1;
-        while (o->sig_park_req)
-            sigsuspend(&wait_mask);                 /* atomic unblock+wait */
-        o->sig_parked = 0;
-    }
+    uintptr_t pc = 0;
+#if defined(__aarch64__)
+    pc = (uintptr_t)((ucontext_t *)uctx)->uc_mcontext.pc;
+#elif defined(__x86_64__)
+    pc = (uintptr_t)((ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
+#else
+    (void)uctx;
+#endif
+    if (o && o->sig_park_req && !o->in_kcall &&
+        (!s_guest_hi || !pc || (pc >= s_guest_lo && pc < s_guest_hi)))
+        w32_park_for_suspend(o);
     errno = saved;
 }
 static void w32_resume_handler(int sig) { (void)sig; }  /* just interrupts sigsuspend */
@@ -797,9 +833,6 @@ static void w32_resume_handler(int sig) { (void)sig; }  /* just interrupts sigsu
  * libc or a driver it may hold a lock the UI or binder threads need (malloc,
  * the GPU driver), so it is left to run and signalled again every 20 ms until
  * it is back in our code. A thread blocked in a wait just stays blocked. */
-#include <link.h>
-#include <ucontext.h>
-
 #define W32_LIVE_MAX 256
 static pthread_mutex_t s_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static w32_object *s_live[W32_LIVE_MAX];
@@ -879,7 +912,7 @@ static void *freeze_ctl_thread(void *arg)
         pthread_mutex_lock(&s_live_lock);
         if (__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST))
             for (int i = 0; i < s_live_n; i++)
-                if (!s_live[i]->host_frozen)
+                if (!s_live[i]->host_frozen && !s_live[i]->sig_parked)
                     pthread_kill(s_live[i]->thread, w32_sig_freeze());
         pthread_mutex_unlock(&s_live_lock);
         usleep(20000);
@@ -897,11 +930,49 @@ static void w32_freeze_point(void)
 {
 #ifdef __linux__
     w32_object *o = t_self_obj;
-    if (!o || !__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST)) return;
+    if (!o) return;
+    /* A cross-thread suspend that arrived while this thread was in host code
+     * (see w32_suspend_handler) takes effect here -- but not from a Sleep
+     * inside a kernel call, which may hold a host lock; the outermost kernel
+     * call's exit parks it before any guest code runs. */
+    if (o->sig_park_req && !o->in_kcall && w32_xsuspend_enabled())
+        w32_park_for_suspend(o);
+    if (!__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST)) return;
     __atomic_store_n(&o->host_frozen, 1, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_host_frozen, __ATOMIC_SEQ_CST))
         usleep(10000);                     /* THAW's signal cuts this short */
     __atomic_store_n(&o->host_frozen, 0, __ATOMIC_SEQ_CST);
+#endif
+}
+
+/* Safe points outside Sleep/SwitchToThread: the kernel brackets every guest
+ * kernel call with these. Only the outermost call counts: guest code a kernel
+ * call runs (a DPC, an APC) may be inside a host lock the outer call holds. */
+void xbox_ThreadKernelEnter(void)
+{
+#ifdef __linux__
+    w32_object *o = t_self_obj;
+    if (!o) return;
+    if (o->in_kcall == 0) w32_freeze_point();
+    o->in_kcall++;
+#endif
+}
+
+void xbox_ThreadKernelExit(void)
+{
+#ifdef __linux__
+    w32_object *o = t_self_obj;
+    if (!o) return;
+    if (o->in_kcall > 0 && --o->in_kcall == 0) w32_freeze_point();
+#endif
+}
+
+void xbox_SetGuestCodeRange(uintptr_t lo, uintptr_t hi)
+{
+#ifdef __linux__
+    if (lo && hi > lo) { s_guest_lo = lo; s_guest_hi = hi; }
+#else
+    (void)lo; (void)hi;
 #endif
 }
 
@@ -1000,7 +1071,10 @@ static void w32_ensure_suspend_signals(void)
     {
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = w32_suspend_handler;
+        sa.sa_sigaction = w32_suspend_handler;
+        /* SA_RESTART: a thread signalled inside a host syscall (a file read)
+         * returns from the handler without parking and must not see EINTR. */
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
         sigfillset(&sa.sa_mask);                    /* block everything in-handler */
         sigaction(w32_sig_suspend(), &sa, NULL);
     }
@@ -1196,11 +1270,27 @@ DWORD SuspendThread(HANDLE h)
     if (w32_xsuspend_enabled()) {
         w32_ensure_suspend_signals();
         pthread_kill(o->thread, w32_sig_suspend());
-        /* Return only once the target is actually parked -- bounded, so a
-         * lost/ignored signal (e.g. a target with no t_self_obj yet) degrades to
-         * the old no-op instead of hanging the caller. */
-        for (int i = 0; i < 200000 && !o->sig_parked; i++)
+        /* Return once the target can no longer run guest code: parked, or
+         * inside a kernel call (it parks on the way out, before any guest
+         * code). A target interrupted in other host code (libc, an MMIO trap)
+         * parks the next time a signal finds it in guest code, so re-send
+         * now and then. Bounded, so a lost/ignored signal (e.g. a target with
+         * no t_self_obj yet) degrades to the old no-op instead of hanging the
+         * caller. */
+        int i;
+        for (i = 0; i < 200000 && !o->sig_parked && !o->in_kcall; i++) {
+            if ((i & 1023) == 1023 && o->sig_park_req)
+                pthread_kill(o->thread, w32_sig_suspend());
             sched_yield();
+        }
+        if (i == 200000) {
+            static int n;
+            if (n++ < 5) {
+                fprintf(stderr, "  [W32THREAD] SuspendThread: target tid %u did not park; "
+                        "continuing\n", (unsigned)o->tid);
+                fflush(stderr);
+            }
+        }
     }
 #endif
     return prev;

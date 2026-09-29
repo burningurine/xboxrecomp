@@ -10281,6 +10281,16 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+/* Safe points for parking a thread (platform/win32_compat.c); Windows parks
+ * threads with the real SuspendThread and has no host freeze. */
+#if defined(_WIN32)
+static void xbox_ThreadKernelEnter(void) {}
+static void xbox_ThreadKernelExit(void) {}
+#else
+extern void xbox_ThreadKernelEnter(void);
+extern void xbox_ThreadKernelExit(void);
+#endif
+
 static void kernel_thunk_dispatch(void)
 {
     int slot = g_kernel_dispatch_slot;
@@ -10404,7 +10414,12 @@ static void kernel_thunk_dispatch(void)
     }
 
     if (bridge) {
+        /* Enter/exit mark where a thread may be parked safely (a pending
+         * host freeze or cross-thread suspend): around the call, not inside
+         * it, where the bridge may hold host locks. */
+        xbox_ThreadKernelEnter();
         bridge();
+        xbox_ThreadKernelExit();
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
          * gating on g_kernel_call_count: a missing bridge is rare and is
