@@ -15,7 +15,7 @@
 
 > **About this fork.** The `blinx-port` branch carries the runtime and recompiler changes behind an
 > unofficial Android port of *Blinx: The Time Sweeper*
-> ([blinx-android](https://github.com/michaeltabet5-blip/blinx-android)).
+> ([blinx-android](https://github.com/burningurine/blinx-android)).
 > - **Android runtime:** a POSIX/ARM64 backend, an MMIO trap, pausing the game when the app is in
 >   the background, and reading game files from inside an APK.
 > - **Lifter correctness fixes** for the recompiler.
