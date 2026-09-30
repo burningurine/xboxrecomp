@@ -558,7 +558,12 @@ class DisasmEngine:
         if m == "sub" and ops.startswith("esp,"):
             return True
         if m == "mov" and ops.replace(" ", "") == "edi,edi":
-            return True   # hot-patch pad
+            # Hot-patch pad -- unless it pads to an embedded switch table:
+            # MSVC aligns the table with the same two bytes (memcpy's
+            # 0x127696). After a ret that looked like a function whose body
+            # was the table and its index bytes decoded as code (default.xbe
+            # 0x11E87A: 1.1 KB of junk and two unresolved stubs).
+            return first.address + first.size not in self.jump_tables
 
         # A function whose frame __SEH_prolog builds:
         #
