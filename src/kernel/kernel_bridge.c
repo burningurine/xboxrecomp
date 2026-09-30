@@ -1682,7 +1682,7 @@ static DWORD gev_timeout_ms(uint32_t timeout_va)
  * the wait, 0 when the caller should keep the legacy "already signalled". */
 static int gev_wait(uint32_t object, uint32_t timeout_va, uint32_t *status)
 {
-    int mode = gev_mode(), known;
+    int mode = gev_mode(), known, fresh;
     uint32_t pulses0 = 0;
     DWORD budget;
     ULONGLONG start, logged_at = 0;
@@ -1696,9 +1696,30 @@ static int gev_wait(uint32_t object, uint32_t timeout_va, uint32_t *status)
     EnterCriticalSection(&g_gev_cs);
     known = gev_find_locked(object);
     if (known < 0 && mode == 1) {
-        LeaveCriticalSection(&g_gev_cs);
-        return 0;
+        /* Nothing has set this event yet, so it may have no producer the
+         * runtime runs, and the legacy answer is "already signalled". A
+         * caller that passes a finite timeout is ready for STATUS_TIMEOUT,
+         * though, and XAPI's USB requests depend on the wait: they submit,
+         * wait up to 50 ms on a KEVENT on their stack that the transfer's
+         * completion sets, and cancel on a timeout. Signalled at once, they
+         * returned while the transfer was in flight, and its completion
+         * later ran on a dead frame (a call through a stale pointer). So a
+         * finite wait blocks; forever and a poll keep the legacy answer. */
+        if (budget == INFINITE || budget == 0) {
+            LeaveCriticalSection(&g_gev_cs);
+            return 0;
+        }
+        {
+            static unsigned nlog;
+            if (nlog++ < 8 || nlog % 1000 == 0) {
+                fprintf(stderr, "  [KEWAIT] guest KEVENT 0x%08X, no producer seen yet:"
+                        " waiting up to %lu ms (#%u)\n", object,
+                        (unsigned long)budget, nlog);
+                fflush(stderr);
+            }
+        }
     }
+    fresh = known < 0;
     if (known >= 0)
         pulses0 = g_gev_known[known].pulses;
 
@@ -1735,6 +1756,15 @@ static int gev_wait(uint32_t object, uint32_t timeout_va, uint32_t *status)
         SleepConditionVariableCS(&g_gev_cv, &g_gev_cs, slice);
     }
     LeaveCriticalSection(&g_gev_cs);
+    if (fresh) {
+        static unsigned nres;
+        if (nres++ < 8 || nres % 1000 == 0) {
+            fprintf(stderr, "  [KEWAIT] guest KEVENT 0x%08X: %s after %llu ms (#%u)\n",
+                    object, *status ? "timed out" : "signalled",
+                    (unsigned long long)(GetTickCount64() - start), nres);
+            fflush(stderr);
+        }
+    }
     return 1;
 }
 
