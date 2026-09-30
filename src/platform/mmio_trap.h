@@ -9,9 +9,11 @@
  *
  * mmio_trap_handle() decodes the faulting AArch64 load/store (LDR/STR in all
  * sizes and addressing forms, sign-extending loads, LDP/STP of general
- * registers), performs it against the registered device, writes the result
- * register and advances the PC. Anything else is left unhandled (the caller's
- * normal crash path then reports it).
+ * registers) or, on an x86-64 host such as the Android emulator, the faulting
+ * x86-64 instruction (mmio_decode.h: moves, extending loads, ALU and compare
+ * forms, SSE moves), performs it against the registered device, writes the
+ * result register and advances the PC. Anything else is left unhandled (the
+ * caller's normal crash path then reports it).
  */
 #ifndef MMIO_TRAP_H
 #define MMIO_TRAP_H

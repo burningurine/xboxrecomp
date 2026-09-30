@@ -1,6 +1,7 @@
 /*
- * mmio_trap.c - device-register emulation via page protection + AArch64
- * load/store decoding. See mmio_trap.h.
+ * mmio_trap.c - device-register emulation via page protection + decoding of
+ * the faulting instruction: AArch64 load/store here, x86-64 by mmio_decode.h
+ * (Windows, and an x86-64 Linux/Android host). See mmio_trap.h.
  *
  * The fault is synchronous: it is raised by the recompiled guest's own
  * load/store, so the handler runs at a well-defined point of guest code and
@@ -261,7 +262,51 @@ unhandled:
     return 0;
 }
 
-#else   /* not aarch64 */
+#elif defined(__x86_64__)
+/* An x86-64 host (the Android emulator's x86_64 image): the faulting
+ * instruction is completed by the decoder the Windows build uses,
+ * mmio_decode.h, against the registers in the signal frame. */
+#include "mmio_decode.h"
+
+static uint64_t x64_read(void *dev, uint32_t off, int size)
+{
+    __typeof__(s_traps[0]) *t = dev;
+    s_reads++;
+    return t->read ? t->read(t->opaque, off, (unsigned)size) : 0;
+}
+
+static void x64_write(void *dev, uint32_t off, uint64_t v, int size)
+{
+    __typeof__(s_traps[0]) *t = dev;
+    s_writes++;
+    if (t->write)
+        t->write(t->opaque, off, v, (unsigned)size);
+}
+
+int mmio_trap_handle(void *fault_addr, void *ucontext)
+{
+    mcontext_t *mc = &((ucontext_t *)ucontext)->uc_mcontext;
+    uintptr_t mem = (uintptr_t)xbox_GetMemoryOffset();
+    uint64_t gva = (uint64_t)((uintptr_t)fault_addr - mem);
+    int t;
+
+    if (!s_ntraps || (uintptr_t)fault_addr < mem || gva > 0xFFFFFFFFull)
+        return 0;
+    if ((t = find_trap(gva)) < 0)
+        return 0;
+    if (mmio_emulate(mc, (uint32_t)(gva - s_traps[t].base), &s_traps[t], x64_read, x64_write))
+        return 1;
+    s_unhandled++;
+    if (s_unhandled <= 8) {
+        const uint8_t *ip = (const uint8_t *)(uintptr_t)mc->gregs[REG_RIP];
+        fprintf(stderr, "  [MMIO] undecoded access at guest 0x%08X: "
+                "%02X %02X %02X %02X %02X %02X\n", (uint32_t)gva,
+                ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
+    }
+    return 0;
+}
+
+#else   /* neither aarch64 nor x86-64 */
 int mmio_trap_handle(void *fault_addr, void *ucontext) { (void)fault_addr; (void)ucontext; return 0; }
 #endif
 
