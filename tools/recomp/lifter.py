@@ -915,10 +915,29 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
 # rather than asking every project to look them up by hand.
 #
 #   __SEH_prolog   mov eax, fs:[0]        64 A1 00 00 00 00
-#                  lea ebp, [esp+0x10]    8D 6C 24 10
+#                  lea ebp, [esp+N]       8D 6C 24 xx
 #   __SEH_epilog   mov fs:[0], ecx        64 89 0D 00 00 00 00
 #                  leave; push ecx; ret   C9 51 C3
-_SEH_PROLOG_MARKERS = (b"\x64\xa1\x00\x00\x00\x00", b"\x8d\x6c\x24\x10")
+#
+# The prolog is identified by the fs:[0] READ (mov eax, fs:[0]) plus the
+# lea ebp,[esp+N] frame set, with ANY lea displacement. A title can ship more
+# than one prolog VARIANT and they differ in two independent ways, so neither a
+# fixed displacement nor a fixed fs-install opcode is safe to require:
+#   - the lea displacement tracks how many slots were pushed -- Blinx has the
+#     [esp+0x10] form (sub_001276F0) AND the [esp+0x0c] form (sub_0012854C);
+#   - the new handler is installed with either `mov fs:[0], esp` (64 89 25) or
+#     `mov fs:[0], eax` (64 A3) -- sub_0012854C uses the former, sub_001276F0
+#     the latter.
+# The old fixed `8D 6C 24 10` marker matched only sub_001276F0, and detection
+# stopped at the first pair, so sub_0012854C's 63 callers ran with an 8-byte-
+# wrong frame (MEM32(ebp+8) read the prolog's own return address instead of
+# arg0). Match on the fs:[0] read + the lea-ebp-esp opcode (3 bytes,
+# displacement-agnostic) and collect ALL variants: reading the current SEH
+# handler and repointing ebp from esp inside a <=128-byte function is uniquely
+# the _EH_prolog idiom, and the epilog never reads fs:[0] into eax so it is not
+# confused for one.
+_SEH_PROLOG_MARKERS = (b"\x64\xa1\x00\x00\x00\x00",
+                       b"\x8d\x6c\x24")
 _SEH_EPILOG_MARKERS = (b"\x64\x89\x0d\x00\x00\x00\x00", b"\xc9\x51\xc3")
 
 # Both are tiny; a large match is something else that happens to touch fs:[0].
@@ -926,15 +945,33 @@ _SEH_PROLOG_MAX_SIZE = 128
 _SEH_EPILOG_MAX_SIZE = 64
 
 
-def detect_seh_helpers(func_db, xbe_data, verbose=False):
-    """Locate __SEH_prolog / __SEH_epilog in the target binary.
+def _seh_addr_set(v):
+    """Normalise an SEH-helper spec to a set of addresses.
 
-    Returns (prolog_addr, epilog_addr); either may be None if not found, which
-    is normal for a title whose CRT does not use them.
+    Accepts None (nothing), a single address (a --seh-prolog/--seh-epilog CLI
+    override), or a set/list of addresses (what detect_seh_helpers returns).
+    """
+    if v is None:
+        return set()
+    if isinstance(v, (set, frozenset, list, tuple)):
+        return {a for a in v if a is not None}
+    return {v}
+
+
+def detect_seh_helpers(func_db, xbe_data, verbose=False):
+    """Locate every __SEH_prolog / __SEH_epilog variant in the target binary.
+
+    Returns (prologs, epilogs) as two sets of addresses, each possibly empty
+    (empty is normal for a title whose CRT does not use them). A title can ship
+    more than one variant of each -- Blinx has two prologs (the [esp+0x10] and
+    [esp+0x0c] forms) -- and missing one leaves all of that variant's callers
+    with a wrong frame pointer, so every match is collected rather than the
+    first pair only.
     """
     from .config import va_to_file_offset
 
-    prolog = epilog = None
+    prologs = set()
+    epilogs = set()
 
     def _size_of(info):
         # "end" is a hex string in functions.json but BatchTranslator rewrites
@@ -964,23 +1001,19 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
             continue
         body = xbe_data[offset:offset + size]
 
-        if (prolog is None and size <= _SEH_PROLOG_MAX_SIZE
-                and all(m in body for m in _SEH_PROLOG_MARKERS)):
-            prolog = addr
-        elif (epilog is None and size <= _SEH_EPILOG_MAX_SIZE
+        if all(m in body for m in _SEH_PROLOG_MARKERS):
+            prologs.add(addr)
+        elif (size <= _SEH_EPILOG_MAX_SIZE
                 and all(m in body for m in _SEH_EPILOG_MARKERS)):
-            epilog = addr
-
-        if prolog is not None and epilog is not None:
-            break
+            epilogs.add(addr)
 
     if verbose:
         import sys
-        fmt = lambda a: f"0x{a:08X}" if a else "not found"
-        print(f"  SEH helpers: __SEH_prolog {fmt(prolog)}, "
-              f"__SEH_epilog {fmt(epilog)}", file=sys.stderr)
+        fmt = lambda s: ", ".join(f"0x{a:08X}" for a in sorted(s)) if s else "not found"
+        print(f"  SEH helpers: __SEH_prolog {fmt(prologs)}; "
+              f"__SEH_epilog {fmt(epilogs)}", file=sys.stderr)
 
-    return prolog, epilog
+    return prologs, epilogs
 
 
 # MSVC's setjmp/longjmp pair, found by the "VC20" cookie the CRT stamps into
@@ -1081,10 +1114,18 @@ class Lifter:
         # leave the other unset -- that is the bug this whole path fixes.
         if (seh_prolog is None or seh_epilog is None) and self.func_db:
             found_prolog, found_epilog = detect_seh_helpers(self.func_db, xbe_data)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
-            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.SEH_PROLOG = seh_prolog
-        self.SEH_EPILOG = seh_epilog
+            if seh_prolog is None:
+                seh_prolog = found_prolog
+            if seh_epilog is None:
+                seh_epilog = found_epilog
+        # seh_prolog/seh_epilog may be a set (detected), a single address (a
+        # --seh-prolog/--seh-epilog override) or None; normalise to sets so a
+        # title with several prolog variants is handled by set membership.
+        self.SEH_PROLOGS = _seh_addr_set(seh_prolog)
+        self.SEH_EPILOGS = _seh_addr_set(seh_epilog)
+        # Representative singles kept for any legacy single-value consumer.
+        self.SEH_PROLOG = min(self.SEH_PROLOGS) if self.SEH_PROLOGS else None
+        self.SEH_EPILOG = min(self.SEH_EPILOGS) if self.SEH_EPILOGS else None
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
@@ -1906,6 +1947,8 @@ class Lifter:
     # callers that construct a Lifter without a function database.
     SEH_PROLOG = None
     SEH_EPILOG = None
+    SEH_PROLOGS = frozenset()
+    SEH_EPILOGS = frozenset()
 
     # The CRT's setjmp/longjmp, detected by detect_setjmp_helpers().
     SETJMP_FN = None
@@ -2008,7 +2051,8 @@ class Lifter:
             # stack address where the caller had just zeroed it, so an
             # "if (status < 0)" test against esi failed and XapiInitProcess
             # bailed to the dashboard.
-            if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
+            if (insn.call_target in self.SEH_PROLOGS
+                    or insn.call_target in self.SEH_EPILOGS):
                 lines.insert(0, "g_seh_ebp = ebp; /* publish frame to SEH helper */")
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
@@ -2034,7 +2078,8 @@ class Lifter:
         # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
         # so the caller can read back the frame pointer.
         prefix = ""
-        if self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG):
+        if (self.func_start in self.SEH_PROLOGS
+                or self.func_start in self.SEH_EPILOGS):
             prefix = "g_seh_ebp = ebp; "
         # Exit trace, for functions that return with a register the caller
         # relied on holding something else. Entry tracing alone cannot show

@@ -25,7 +25,8 @@ class _Insn:
 
 
 class _Lifter:
-    SEH_PROLOG = 0x005B2D78
+    SEH_PROLOGS = frozenset({0x005B2D78})
+    SEH_EPILOGS = frozenset()
 
 
 class _T:
@@ -62,6 +63,6 @@ class SehFrameOwnerTest(unittest.TestCase):
         self.assertFalse(self.t._func_owns_a_frame(insns))
 
     def test_no_seh_prolog_in_the_binary_is_not_a_frame(self):
-        self.t.lifter.SEH_PROLOG = None
+        self.t.lifter.SEH_PROLOGS = frozenset()
         insns = [_Insn("call", "0x5b2d78", call_target=0x005B2D78)]
         self.assertFalse(self.t._func_owns_a_frame(insns))
