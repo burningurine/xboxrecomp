@@ -446,6 +446,93 @@ _REG_FAMILY = {reg: full for full, regs in (
     ("ebp", ("bp", "ebp")), ("esp", ("sp", "esp"))) for reg in regs}
 
 
+# Join snapshots. When a join's predecessors set the flags with different
+# operations (MSVC's `x % 2`: `and` on one edge, `inc` on the other, then the
+# join rewrites the register before its `je`), each predecessor's setter also
+# records a normalized pair in _ja/_jb such that the flags equal those of
+# `cmp _ja, _jb` at the setter's width: cmp/sub (a, b), test (a & b, 0), the
+# rest (result, 0). The join's jcc then uses the cmp lowering on the pair.
+# CF and OF match only for cmp/sub (exact) and test/and/or/xor (both 0); after
+# add/inc/dec/neg only ZF and SF do (inc/dec leave CF alone).
+JSNAP_EXACT = frozenset(("cmp", "sub", "test", "and", "or", "xor"))
+JSNAP_ZS = frozenset(("add", "inc", "dec", "neg"))
+_JSNAP_ZS_JCC = frozenset(("je", "jz", "jne", "jnz", "js", "jns"))
+_JSNAP_EXACT_JCC = _JSNAP_ZS_JCC | frozenset((
+    "jl", "jnge", "jge", "jnl", "jle", "jng", "jg", "jnle",
+    "jb", "jnae", "jc", "jae", "jnb", "jnc", "jbe", "jna", "ja", "jnbe"))
+
+
+def _jsnap_stmts(insn):
+    """The _ja/_jb pair for insn (see JSNAP_EXACT). cmp/sub read their
+    operands, so a sub's pair is emitted before it; the rest read the result."""
+    ops = insn.operands
+    w = _operand_width(ops[0]) or (_operand_width(ops[1]) if len(ops) > 1 else None) or 4
+    mask = {1: "0xFFu", 2: "0xFFFFu"}.get(w, "0xFFFFFFFFu")
+    cast = {1: "(int8_t)", 2: "(int16_t)"}.get(w, "(int32_t)")
+    m = insn.mnemonic
+    if m in ("cmp", "sub"):
+        a, b = _fmt_operand_read(ops[0]), _fmt_operand_read(ops[1])
+    elif m == "test":
+        a = f"(uint32_t)({_fmt_operand_read(ops[0])}) & (uint32_t)({_fmt_operand_read(ops[1])})"
+        b = "0"
+    else:
+        a, b = _fmt_operand_read(ops[0]), "0"
+    return [f"_ja = (uint32_t)({a}) & {mask}; _jb = (uint32_t)({b}) & {mask};",
+            f"_jas = (int32_t){cast}(_ja); _jbs = (int32_t){cast}(_jb); /* {m}: join snapshot */"]
+
+
+def plan_join_snapshot(join_bb, pred_blocks, states, follow=()):
+    """Join-snapshot plan for a join whose predecessor states do not merge.
+
+    Returns (state, setter_addresses) or None. Every predecessor's state must
+    come from a setter inside that predecessor (JSNAP_EXACT/JSNAP_ZS), and
+    the first flag reader -- in the join block or the blocks in `follow`, the
+    join's single-predecessor fall-through chain -- must be a jcc the mix
+    supports, with nothing touching the flags before it. Setter widths may
+    differ except for js/jns: each setter masks and sign-extends its own pair.
+    """
+    if not states or any(not s or not s[0] for s in states):
+        return None
+    kinds = {s[0] for s in states}
+    if not kinds <= (JSNAP_EXACT | JSNAP_ZS):
+        return None
+    reader = None
+    for insn in [i for b in (join_bb,) + tuple(follow) for i in b.instructions]:
+        m = insn.mnemonic
+        if insn.is_cond_jump:
+            reader = insn
+            break
+        if m == "jmp" or (m in _EFLAGS_PRESERVE and m not in ("popfd", "call", "int", "int3")):
+            continue
+        if (m.startswith("f") and m not in ("fcomi", "fcomip", "fucomi", "fucomip",
+                                              "fcompi", "fucompi")):
+            continue
+        return None
+    if reader is None or reader.mnemonic in ("jecxz", "jcxz"):
+        return None
+    exact = kinds <= JSNAP_EXACT
+    if reader.mnemonic not in (_JSNAP_EXACT_JCC if exact else _JSNAP_ZS_JCC):
+        return None
+    setters, width = [], None
+    for bb, (kind, ops) in zip(pred_blocks, states):
+        need = 1 if kind in ("inc", "dec", "neg") else 2
+        found = None
+        for insn in reversed(bb.instructions):
+            if (insn.mnemonic == kind and len(insn.operands) == len(ops)
+                    and all(x is y for x, y in zip(insn.operands, ops))):
+                found = insn
+                break
+        if found is None or len(ops) < need:
+            return None
+        w = _operand_width(ops[0]) or (_operand_width(ops[1]) if len(ops) > 1 else None)
+        if w is None or (width is not None and w != width
+                         and reader.mnemonic in ("js", "jns")):
+            return None
+        width = w
+        setters.append(found.address)
+    return ("jsnap" if exact else "jsnap_zs", [states[0][1][0]]), setters
+
+
 def _writes_reg_family(insn, reg):
     """Whether insn writes any part of the 32-bit register holding reg."""
     def family(r):
@@ -518,7 +605,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # comparison happens. Use those rather than re-reading registers that may
     # since have changed.
     SIGNED = {"CMP_L", "CMP_LE", "CMP_G", "CMP_GE", "TEST_S"}
-    if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
+    if flag_setter in ("jsnap", "jsnap_zs"):
+        # A join snapshot reads as `cmp _ja, _jb` (plan_join_snapshot).
+        if jcc not in (_JSNAP_EXACT_JCC if flag_setter == "jsnap" else _JSNAP_ZS_JCC):
+            return None
+        signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
+        lhs, rhs = ("_jas", "_jbs") if signed else ("_ja", "_jb")
+        flag_setter = "cmp"
+    elif flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
     elif len(flag_ops) >= 2:
@@ -3402,7 +3496,7 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+def lift_basic_block(lifter, bb, flag_state=None, jsnap_at=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -3412,6 +3506,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
         bb: BasicBlock with instructions
         flag_state: tuple of (flag_setter_mnemonic, flag_operands) from
                     a preceding block, or None
+        jsnap_at: addresses of flag setters that also write the join
+                  snapshot _ja/_jb (plan_join_snapshot), or None
 
     Returns:
         (stmts, flag_state) where stmts is a list of C statement strings
@@ -3443,6 +3539,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
             if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, flag_insn.operands, flag_insn.mnemonic))
+            if jsnap_at and flag_insn.address in jsnap_at:
+                stmts.extend(_jsnap_stmts(flag_insn))
             stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             last_flag_ops = list(flag_insn.operands)
@@ -3498,6 +3596,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        snap = jsnap_at and curr.address in jsnap_at
+        if snap and curr.mnemonic == "sub":
+            stmts.extend(_jsnap_stmts(curr))       # sub's pair is its operands
+
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
         # instructions (e.g. neg eax; push edi; sbb eax, eax).
@@ -3517,6 +3619,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
         else:
             results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
+        if snap and curr.mnemonic != "sub":
+            stmts.extend(_jsnap_stmts(curr))       # the result, at its width
 
         # Track flag-setting instructions
         if curr.mnemonic in FLAG_SETTERS:
