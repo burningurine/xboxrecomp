@@ -61,10 +61,13 @@
 #include "../kernel/frame_stats.h"
 #include <stdio.h>
 #include <android/log.h>
+#ifndef XR_LOG_TAG
+#define XR_LOG_TAG "xr"   /* logcat tag prefix: the title's library name, set by its build */
+#endif
 
 #include "nv2a_pgraph_gles.h"
 
-#define GLLOG(...) __android_log_print(ANDROID_LOG_INFO, "blinx-gl3d", __VA_ARGS__)
+#define GLLOG(...) __android_log_print(ANDROID_LOG_INFO, XR_LOG_TAG "-gl3d", __VA_ARGS__)
 
 /* One vertex handed to GL: clip-space position, packed RGBA colour, UV. */
 typedef struct { float x, y, z, w; float r, g, b, a; float u, v; } GlVertex;

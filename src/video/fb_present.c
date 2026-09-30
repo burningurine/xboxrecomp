@@ -223,6 +223,9 @@ void xbox_FramebufferWindowStart(void)
 #include <GLES3/gl3.h>
 #include <android/native_window.h>
 #include <android/log.h>
+#ifndef XR_LOG_TAG
+#define XR_LOG_TAG "xr"   /* logcat tag prefix: the title's library name, set by its build */
+#endif
 #include <pthread.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -230,13 +233,13 @@ void xbox_FramebufferWindowStart(void)
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-extern void *blinx_get_android_window(void);   /* jni_bridge.c */
+extern void *xr_android_window(void);   /* android_runtime/host/jni_bridge.c */
 #include "../nv2a/nv2a_pgraph_gles.h"          /* GLES 3D overlay (object-space batches) */
 #include "../kernel/frame_stats.h"
 #include "../kernel/nv2a_backend.h"
 #include <time.h>
 
-#define FBLOG(...) __android_log_print(ANDROID_LOG_INFO, "blinx-fb", __VA_ARGS__)
+#define FBLOG(...) __android_log_print(ANDROID_LOG_INFO, XR_LOG_TAG "-fb", __VA_ARGS__)
 
 static volatile int      s_fb_running;
 static volatile uint32_t s_fb_va, s_fb_pitch;
@@ -287,7 +290,7 @@ static int fb_thread_backend(const NV2ABackend *be)
     ANativeWindow *had = NULL;
     FBLOG("presenter: using GPU backend '%s'", be->name ? be->name : "?");
     while (s_fb_running) {
-        ANativeWindow *w = (ANativeWindow *)blinx_get_android_window();
+        ANativeWindow *w = (ANativeWindow *)xr_android_window();
         if (w != had && had && be->window_lost)
             be->window_lost();
         had = w;
@@ -364,7 +367,7 @@ static void *fb_thread(void *unused)
     int            pulse = 0;
 
     while (s_fb_running) {
-        ANativeWindow *w = (ANativeWindow *)blinx_get_android_window();
+        ANativeWindow *w = (ANativeWindow *)xr_android_window();
         if (w != cur) {                       /* Surface appeared / changed / lost */
             if (surf != EGL_NO_SURFACE) {
                 eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

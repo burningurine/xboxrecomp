@@ -33,6 +33,9 @@
   #include <EGL/egl.h>
   #include <android/native_window.h>
   #include <android/log.h>
+  #ifndef XR_LOG_TAG
+  #define XR_LOG_TAG "xr"   /* logcat tag prefix: the title's library name, set by its build */
+  #endif
   #include <pthread.h>
   #include <unistd.h>
   /* GLES exposes the float-suffixed depth entry points, not the desktop names. */
@@ -87,7 +90,7 @@ void xbox_D3D8SetAndroidWindow(void *win)
     pthread_mutex_lock(&g_win_lock);
     g_anative_win = (ANativeWindow *)win;
     pthread_mutex_unlock(&g_win_lock);
-    __android_log_print(ANDROID_LOG_INFO, "blinx-gl",
+    __android_log_print(ANDROID_LOG_INFO, XR_LOG_TAG "-gl",
                         "ANativeWindow %s", win ? "attached" : "cleared");
 }
 
@@ -1078,14 +1081,14 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     {
         ANativeWindow *win = d3dgl_wait_for_window();
         if (!win) {
-            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+            __android_log_print(ANDROID_LOG_ERROR, XR_LOG_TAG "-gl",
                                 "no ANativeWindow after 10s; cannot create GL device");
             return D3DERR_INVALIDCALL;
         }
         EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
         EGLint emaj = 0, emin = 0;
         if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &emaj, &emin)) {
-            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+            __android_log_print(ANDROID_LOG_ERROR, XR_LOG_TAG "-gl",
                                 "eglInitialize failed 0x%x", eglGetError());
             return D3DERR_INVALIDCALL;
         }
@@ -1098,7 +1101,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
         };
         EGLConfig cfg; EGLint ncfg = 0;
         if (!eglChooseConfig(dpy, cfg_attrs, &cfg, 1, &ncfg) || ncfg < 1) {
-            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+            __android_log_print(ANDROID_LOG_ERROR, XR_LOG_TAG "-gl",
                                 "eglChooseConfig failed 0x%x", eglGetError());
             return D3DERR_INVALIDCALL;
         }
@@ -1112,7 +1115,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
                         ? eglCreateWindowSurface(dpy, cfg, win, NULL) : EGL_NO_SURFACE;
         if (ctx == EGL_NO_CONTEXT || surf == EGL_NO_SURFACE ||
             !eglMakeCurrent(dpy, surf, surf, ctx)) {
-            __android_log_print(ANDROID_LOG_ERROR, "blinx-gl",
+            __android_log_print(ANDROID_LOG_ERROR, XR_LOG_TAG "-gl",
                                 "EGL context/surface bring-up failed 0x%x", eglGetError());
             return D3DERR_INVALIDCALL;
         }
@@ -1125,7 +1128,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
             eglQuerySurface(dpy, surf, EGL_HEIGHT, &sh);
             if (sw > 0 && sh > 0) { g.backbuf_w = sw; g.backbuf_h = sh; }
         }
-        __android_log_print(ANDROID_LOG_INFO, "blinx-gl",
+        __android_log_print(ANDROID_LOG_INFO, XR_LOG_TAG "-gl",
                             "EGL %d.%d  %dx%d  GL %s / GLSL %s", emaj, emin,
                             g.backbuf_w, g.backbuf_h,
                             (const char *)glGetString(GL_VERSION),

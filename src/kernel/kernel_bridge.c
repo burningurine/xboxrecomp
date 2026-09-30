@@ -3667,6 +3667,9 @@ static int g_timer_started;
 static volatile uint32_t g_timer_beat;
 #if defined(__ANDROID__)
 #include <android/log.h>
+#ifndef XR_LOG_TAG
+#define XR_LOG_TAG "xr"   /* logcat tag prefix: the title's library name, set by its build */
+#endif
 #include <link.h>
 #include <pthread.h>
 #include <signal.h>
@@ -3728,7 +3731,7 @@ static void hang_dump_handler(int sig, siginfo_t *si, void *uctx)
             }
         }
     }
-    __android_log_write(ANDROID_LOG_WARN, "blinx-hang", buf);
+    __android_log_write(ANDROID_LOG_WARN, XR_LOG_TAG "-hang", buf);
 }
 
 static void *hang_watch_thread(void *arg)
@@ -3747,7 +3750,7 @@ static void *hang_watch_thread(void *arg)
         }
         if (++still >= 6 && !dumped) {
             dumped = 1;
-            __android_log_print(ANDROID_LOG_WARN, "blinx-hang",
+            __android_log_print(ANDROID_LOG_WARN, XR_LOG_TAG "-hang",
                                 "[HANG] timer thread stalled 3 s (beat %u); dumping guest threads",
                                 beat);
             xbox_HostSignalLiveThreads(SIGRTMIN + 6);

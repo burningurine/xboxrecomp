@@ -16,6 +16,9 @@
 #endif
 #if defined(__ANDROID__)
 #  include <android/log.h>
+#  ifndef XR_LOG_TAG
+#  define XR_LOG_TAG "xr"   /* logcat tag prefix: the title's library name, set by its build */
+#  endif
 #endif
 
 extern void kernel_vblank_get_stats(uint64_t *fired, uint64_t *dropped);  /* kernel_bridge.c */
@@ -237,7 +240,7 @@ void fs_log_tick(void)
     if (!s_snap.valid || s_logged_seq == s_snap_seq) return;
     s_logged_seq = s_snap_seq;
 #if defined(__ANDROID__)
-    __android_log_print(ANDROID_LOG_INFO, "blinx-stats",
+    __android_log_print(ANDROID_LOG_INFO, XR_LOG_TAG "-stats",
 #else
     fprintf(stderr,
 #endif
