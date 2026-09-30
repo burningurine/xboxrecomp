@@ -670,6 +670,9 @@ class FunctionDetector:
         must decode to a ret. A data word that happens to fall in a code
         section's range fails the decode; an offset into a real function fails
         the gap.
+
+        Tables are read from data sections, and narrowly from a code section's
+        own uncovered words (XAPI's XPP driver table lives in its code section).
         """
         code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
                        for sec in sections]
@@ -696,7 +699,7 @@ class FunctionDetector:
         # 2's static initialisers are addresses inside another function and
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
-        targets = set()
+        targets = {}                        # target -> probe length for a gap
         for sec in self.image.sections:
             if sec.name in code_names:
                 continue                    # scan data, not code
@@ -706,7 +709,70 @@ class FunctionDetector:
             for off in range(0, len(data) - 3, 4):
                 value = int.from_bytes(data[off:off + 4], "little")
                 if in_code_section(value):
-                    targets.add(value)
+                    targets.setdefault(value, 64)
+
+        # A code section can hold a table too, where no function covers it.
+        # XAPI keeps its USB class-driver table -- each driver's add/remove
+        # device routines -- at the head of its own XPP section, and nothing
+        # else names those routines: in Blinx the pad's driver and five others
+        # were missing, so a plugged-in controller enumerated and then called
+        # into nothing.
+        #
+        # Most uncovered words in a code section are not such a table, so the
+        # scan is narrow. Blinx marks 40 MB of models and maps executable;
+        # reading them as tables added 12,000 entries. So:
+        #  - preloaded sections only (the models and maps load on demand);
+        #  - not a switch's jump table: its entries are case labels (Blinx has
+        #    one at 0x00122308 whose 85 labels were not yet inside a function);
+        #  - a target in the table's own section that no function covers, and
+        #    not in the gap the table sits in (the table linking its entries);
+        #  - where a function can begin: the section's start, after padding,
+        #    or right after a ret or jmp. A word of uncovered code is often a
+        #    call's bytes, pointing into the middle of a block.
+        # What is left in Blinx is exactly the six routines. XAPI's XID routine
+        # runs 66 instructions before its first ret, so these get the full
+        # probe.
+        def gap(addr: int) -> int:
+            return bisect.bisect_right(starts, addr)
+
+        tables = sorted(self.engine.jump_tables.items())
+        table_starts = [t[0] for t in tables]
+
+        def in_a_jump_table(addr: int) -> bool:
+            i = bisect.bisect_right(table_starts, addr) - 1
+            return i >= 0 and addr < tables[i][1]
+
+        def can_begin_at(addr: int, sec_lo: int) -> bool:
+            if addr == sec_lo:
+                return True
+            before = self.image.read_bytes_at_va(addr - 1, 1)
+            if before and before[0] in (0xCC, 0x90):
+                return True
+            for back in range(1, 16):
+                insn = self.engine.instructions.get(addr - back)
+                if (insn is not None and insn.end_address == addr
+                        and (insn.is_ret or insn.is_jump)):
+                    return True
+            return False
+
+        for sec in sections:
+            flags = getattr(sec, "flags", "") or ""
+            if "PRE" not in [f.strip() for f in flags.split(",")]:
+                continue
+            data = self.image.get_section_data(sec)
+            if not data:
+                continue
+            lo, hi = sec.virtual_addr, sec.virtual_addr + sec.virtual_size
+            for off in range(0, len(data) - 3, 4):
+                va = lo + off
+                if (inside_a_function(va) or inside_a_function(va + 3)
+                        or in_a_jump_table(va)):
+                    continue
+                value = int.from_bytes(data[off:off + 4], "little")
+                if (lo <= value < hi and not inside_a_function(value)
+                        and gap(value) != gap(va)
+                        and can_begin_at(value, lo)):
+                    targets[value] = 8192
 
         # Alias entries, not candidates.
         #
@@ -763,8 +829,8 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
-                if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                if not self.engine.probes_as_function_body(
+                        target, max_insns=targets[target]):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
