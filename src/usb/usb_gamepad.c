@@ -4,18 +4,24 @@
  * Descriptors and the input report, from the USB 2.0 specification for the
  * standard requests and from the device's own published interface class for
  * the rest. The gamepad is not a HID device: it reports interface class 0x58
- * subclass 0x42, which is Microsoft's own, and its report has a fixed layout
- * rather than one described by a HID report descriptor. That is why there is
- * no report descriptor here and why nothing asks for one.
+ * subclass 0x42 (XID), which is Microsoft's own, and its report has a fixed
+ * layout rather than one described by a HID report descriptor. That is why
+ * there is no report descriptor here and why nothing asks for one. What the
+ * console's XID driver does ask for, on the interface, is the XID descriptor
+ * (device type, report sizes) and the capabilities (which buttons and axes
+ * exist); without those answers it never opens the pad.
  *
  * Input comes from the host through the existing xbox_input layer, so a real
- * pad plugged into the PC drives this one.
+ * pad plugged into the PC, or the phone's controls, drive this one.
  */
 #include "usb_gamepad.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* The host's own pad, through the layer that already maps one to XInput. */
+#include "../input/xinput_xbox.h"
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -49,10 +55,48 @@ static const uint8_t s_config_desc[32] = {
     7, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04
 };
 
+/* The XID descriptor (type 0x42), fetched with a vendor request on the
+ * interface: XID 1.00, a gamepad, 20-byte input and 6-byte output reports, no
+ * alternate product ids. */
+static const uint8_t s_xid_desc[16] = {
+    16, 0x42, 0x00, 0x01, 0x01, 0x01, 20, 6,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+/* GET_CAPABILITIES: the input report with every control present, and the
+ * rumble report with both motors present. */
+static const uint8_t s_caps_in[20] = {
+    0x00, 20, 0xFF, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+static const uint8_t s_caps_out[6] = { 0x00, 6, 0xFF, 0xFF, 0xFF, 0xFF };
+
 static uint8_t s_address;
 static uint8_t s_configuration;
+static uint8_t s_last_report[20];
+static int     s_report_fresh = 1;   /* the next IN delivers whatever it holds */
 
 uint8_t usb_gamepad_address(void) { return s_address; }
+
+void usb_gamepad_reset(void)
+{
+    s_address = 0;
+    s_configuration = 0;
+    s_report_fresh = 1;
+}
+
+/* Rumble, from either an interrupt OUT or a SET_REPORT: [0] id, [1] length 6,
+ * then the left and right motor speeds, little endian. */
+static void rumble(const uint8_t *r, int len)
+{
+    XBOX_VIBRATION v;
+    if (len < 6 || r[1] < 6)
+        return;
+    v.wLeftMotorSpeed  = (WORD)(r[2] | (r[3] << 8));
+    v.wRightMotorSpeed = (WORD)(r[4] | (r[5] << 8));
+    xbox_InputSetState(0, &v);
+}
 
 /* ---- control transfers ------------------------------------------------- */
 
@@ -79,10 +123,16 @@ static int copy_out(uint8_t *out, int max, const uint8_t *src, int len,
     return len;
 }
 
-int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
+#define REQ_XID_GET_CAPABILITIES 0x01   /* vendor, interface               */
+#define REQ_HID_GET_REPORT       0x01   /* class, interface                */
+#define REQ_HID_SET_REPORT       0x09   /* class, interface                */
+#define DESC_XID                 0x42
+
+int usb_gamepad_control(const UsbSetup *setup, const uint8_t *data, int data_len,
+                        uint8_t *out, int max)
 {
     int is_in = (setup->bmRequestType & 0x80) != 0;
-    int type  = (setup->bmRequestType >> 5) & 3;   /* 0 standard, 1 class */
+    int type  = (setup->bmRequestType >> 5) & 3;   /* 0 standard, 1 class, 2 vendor */
 
     if (type == 0) {
         switch (setup->bRequest) {
@@ -109,6 +159,7 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
 
         case REQ_SET_CONFIGURATION:
             s_configuration = (uint8_t)(setup->wValue & 0xFF);
+            s_report_fresh = 1;
             return 0;
 
         case REQ_GET_CONFIGURATION:
@@ -132,16 +183,59 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         }
     }
 
-    /* Class requests. The Xbox pad answers a vendor-defined capabilities
-     * request on the interface; anything else is not ours to guess at. */
+    /* The XID requests, on the interface. The descriptor and the
+     * capabilities are vendor requests; the current report and rumble are the
+     * HID-style class requests. Either type is accepted for the first two:
+     * the answer is the same and a stall would lose the pad. */
+    if (is_in && setup->bRequest == REQ_GET_DESCRIPTOR
+              && (setup->wValue >> 8) == DESC_XID)
+        return copy_out(out, max, s_xid_desc, (int)sizeof s_xid_desc, setup->wLength);
+    if (is_in && type == 2 && setup->bRequest == REQ_XID_GET_CAPABILITIES) {
+        if (setup->wValue == 0x0100)
+            return copy_out(out, max, s_caps_in, (int)sizeof s_caps_in, setup->wLength);
+        if (setup->wValue == 0x0200)
+            return copy_out(out, max, s_caps_out, (int)sizeof s_caps_out, setup->wLength);
+        return -1;
+    }
+    if (is_in && type == 1 && setup->bRequest == REQ_HID_GET_REPORT) {
+        uint8_t rep[20];
+        int n = usb_gamepad_report(rep, (int)sizeof rep);
+        return copy_out(out, max, rep, n, setup->wLength);
+    }
+    if (!is_in && type == 1 && setup->bRequest == REQ_HID_SET_REPORT) {
+        rumble(data, data_len);
+        return 0;
+    }
     return -1;
+}
+
+int usb_gamepad_in(int endpoint, uint8_t *out, int max)
+{
+    uint8_t rep[20];
+    int n;
+
+    (void)endpoint;
+    if (!s_configuration)
+        return USB_NAK;
+    n = usb_gamepad_report(rep, (int)sizeof rep);
+    if (!s_report_fresh && memcmp(rep, s_last_report, sizeof rep) == 0)
+        return USB_NAK;
+    memcpy(s_last_report, rep, sizeof rep);
+    s_report_fresh = 0;
+    if (n > max) n = max;
+    memcpy(out, rep, (size_t)n);
+    return n;
+}
+
+int usb_gamepad_out(int endpoint, const uint8_t *data, int len)
+{
+    (void)endpoint;
+    rumble(data, len);
+    return len;
 }
 
 /* ---- the input report -------------------------------------------------- */
 
-/* The host's own pad, through the layer that already maps one to XInput.
- * A real controller plugged into the PC drives this emulated one. */
-#include "../input/xinput_xbox.h"
 
 /*
  * The Xbox report is 20 bytes and fixed:

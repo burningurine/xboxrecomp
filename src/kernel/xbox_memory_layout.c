@@ -179,6 +179,48 @@ size_t xbox_GetMappedSize(void)
     return g_memory_size;
 }
 
+/* Physical addresses, for device models that do DMA (the USB controllers).
+ *
+ * MmGetPhysicalAddress answers P for the contiguous window's 0x80000000+P,
+ * and the address itself for everything else. Below 64 MB the two collide:
+ * the contiguous arena and the heap both start just above the image, so P can
+ * be a pushbuffer at 0x80000000+P or a heap or image buffer at P. The GPU view
+ * resolves P < 64 MB to the window, which is right for what the GPU is given.
+ * A USB driver also hands the controller its callers' own buffers -- XAPI's
+ * setup packets live in the image's data -- so it needs the other answer too.
+ *
+ * MmGetPhysicalAddress notes each page it converts and which way it went, and
+ * xbox_PhysToHost resolves through that note before falling back to the GPU
+ * view. A driver converts a buffer right before handing it over, so the note
+ * is fresh; a page nobody converted resolves as the GPU view does. */
+#define PHYS_NOTE_SLOTS 1024
+static volatile uint32_t g_phys_note[PHYS_NOTE_SLOTS];   /* page << 1 | identity */
+
+void xbox_PhysNote(uint32_t pa, int identity)
+{
+    uint32_t page = pa >> 12;
+    g_phys_note[page % PHYS_NOTE_SLOTS] = (page << 1) | (identity ? 1u : 0u);
+}
+
+uint8_t *xbox_PhysToHost(uint32_t pa, uint32_t bytes)
+{
+    uint32_t page = pa >> 12;
+    uint64_t end = (uint64_t)pa + bytes;
+
+    if (pa == 0)
+        return NULL;
+    if (g_phys_note[page % PHYS_NOTE_SLOTS] == ((page << 1) | 1u)
+            && end <= (uint64_t)g_memory_size)
+        return (uint8_t *)g_memory_offset + pa;              /* identity  */
+    if (g_gpu_phys_view && end <= XBOX_GPU_PHYS_SPAN)
+        return g_gpu_phys_view + pa;                          /* GPU view  */
+    if (end <= XBOX_CONTIG_SIZE)
+        return (uint8_t *)g_memory_offset + XBOX_CONTIG_BASE + pa;
+    if (end <= (uint64_t)g_memory_size)
+        return (uint8_t *)g_memory_offset + pa;
+    return NULL;
+}
+
 static size_t xbox_TiledApertureSize(void)
 {
     uint64_t end = XBOX_NV2A_BASE < 0x100000000ULL

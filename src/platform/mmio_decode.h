@@ -31,9 +31,11 @@
 #if defined(_WIN32)
 #include <windows.h>
 
-/* Service one register access. dev is passed straight back to the callbacks. */
-typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
-typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
+/* Service one register access. dev is passed straight back to the callbacks.
+ * (Named apart from mmio_trap.h's mmio_read_fn, which takes an unsigned size,
+ * so one file can use both.) */
+typedef uint64_t (*mmio_dec_read_fn)(void *dev, uint32_t off, int size);
+typedef void     (*mmio_dec_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 
 static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
 {
@@ -84,7 +86,7 @@ static inline void mmio_set_flags(PCONTEXT ctx, uint64_t result, int size,
 
 /* 1 if the instruction at ctx->Rip was serviced and Rip advanced past it. */
 static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
-                               mmio_read_fn rd, mmio_write_fn wr)
+                               mmio_dec_read_fn rd, mmio_dec_write_fn wr)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
     int prefix = 0, has66 = 0, rex = 0, has_rex = 0;

@@ -2146,6 +2146,9 @@ static void bridge_MmGetPhysicalAddress(void)
     g_eax = (addr >= XBOX_CONTIG_BASE &&
              (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
           ? addr - XBOX_CONTIG_BASE : addr;
+    /* Which way it went, for device models that follow the address back
+     * (xbox_PhysToHost): below 64 MB both answers are possible. */
+    xbox_PhysNote(g_eax, g_eax == addr);
     {   /* RECOMP_PHYSLOG: who asks for physical addresses, and of what */
         static int on = -1, n;
         if (on < 0) on = getenv("RECOMP_PHYSLOG") != NULL;

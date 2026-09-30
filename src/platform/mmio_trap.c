@@ -265,7 +265,99 @@ unhandled:
 int mmio_trap_handle(void *fault_addr, void *ucontext) { (void)fault_addr; (void)ucontext; return 0; }
 #endif
 
-#else   /* not POSIX: the Windows build uses its VEH hooks */
+#elif defined(_WIN32)
+/* Windows: the same registry, with the pages made PAGE_NOACCESS and the
+ * faulting x86-64 instruction completed by mmio_decode.h. The host's vectored
+ * exception handler calls mmio_trap_handle(fault address, ContextRecord)
+ * first, as the POSIX SIGSEGV handler does. The older VEH hooks
+ * (nv2a_mmio_hook.c, apu_mmio_hook.c) keep their own ranges. */
+#include <windows.h>
+#include "mmio_decode.h"
+
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+#define MAX_TRAPS 8
+typedef struct {
+    uint32_t base, size;
+    mmio_read_fn read;
+    mmio_write_fn write;
+    void *opaque;
+} MmioTrap;
+static MmioTrap s_traps[MAX_TRAPS];
+static volatile LONG s_ntraps;
+static volatile LONG64 s_reads, s_writes, s_unhandled;
+
+static uint64_t dec_read(void *dev, uint32_t off, int size)
+{
+    MmioTrap *t = (MmioTrap *)dev;
+    InterlockedIncrement64(&s_reads);
+    return t->read(t->opaque, off, (unsigned)size);
+}
+
+static void dec_write(void *dev, uint32_t off, uint64_t val, int size)
+{
+    MmioTrap *t = (MmioTrap *)dev;
+    InterlockedIncrement64(&s_writes);
+    t->write(t->opaque, off, val, (unsigned)size);
+}
+
+int mmio_trap_register(uint32_t guest_base, uint32_t size,
+                       mmio_read_fn read, mmio_write_fn write, void *opaque)
+{
+    uintptr_t host = (uintptr_t)xbox_GetMemoryOffset() + guest_base;
+    DWORD old;
+    LONG n = s_ntraps;
+
+    if (n >= MAX_TRAPS || (guest_base & 0xFFF) || (size & 0xFFF))
+        return -1;
+    s_traps[n].base = guest_base;
+    s_traps[n].size = size;
+    s_traps[n].read = read;
+    s_traps[n].write = write;
+    s_traps[n].opaque = opaque;
+    if (!VirtualProtect((LPVOID)host, size, PAGE_NOACCESS, &old)) {
+        fprintf(stderr, "  [MMIO] VirtualProtect 0x%08X+0x%X failed (%lu)\n",
+                guest_base, size, GetLastError());
+        return -1;
+    }
+    InterlockedExchange(&s_ntraps, n + 1);
+    fprintf(stderr, "  [MMIO] trapping guest 0x%08X..0x%08X\n", guest_base, guest_base + size);
+    return 0;
+}
+
+int mmio_trap_handle(void *fault_addr, void *ucontext)
+{
+    uintptr_t off = (uintptr_t)xbox_GetMemoryOffset();
+    uint64_t gva = (uint64_t)((uintptr_t)fault_addr - off);
+    LONG i, n = s_ntraps;
+
+    if ((uintptr_t)fault_addr < off || gva > 0xFFFFFFFFull)
+        return 0;
+    for (i = 0; i < n; i++) {
+        MmioTrap *t = &s_traps[i];
+        if (gva >= t->base && gva < (uint64_t)t->base + t->size) {
+            if (mmio_emulate((PCONTEXT)ucontext, (uint32_t)gva - t->base, t, dec_read, dec_write))
+                return 1;
+            if (InterlockedIncrement64(&s_unhandled) <= 8) {
+                const uint8_t *ip = (const uint8_t *)((PCONTEXT)ucontext)->Rip;
+                fprintf(stderr, "  [MMIO] undecoded access at guest 0x%08X: "
+                        "%02X %02X %02X %02X %02X %02X\n", (uint32_t)gva,
+                        ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+void mmio_trap_stats(uint64_t *reads, uint64_t *writes, uint64_t *unhandled)
+{
+    if (reads) *reads = (uint64_t)s_reads;
+    if (writes) *writes = (uint64_t)s_writes;
+    if (unhandled) *unhandled = (uint64_t)s_unhandled;
+}
+
+#else
 int mmio_trap_register(uint32_t guest_base, uint32_t size,
                        mmio_read_fn read, mmio_write_fn write, void *opaque)
 { (void)guest_base; (void)size; (void)read; (void)write; (void)opaque; return -1; }

@@ -231,6 +231,12 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
+/* Physical address -> host pointer for `bytes` bytes, for device models that
+ * do DMA; NULL if it is not guest memory. MmGetPhysicalAddress records which
+ * way each page it converted went (xbox_PhysNote), since below 64 MB the
+ * contiguous window and the rest of memory share physical numbers. */
+uint8_t *xbox_PhysToHost(uint32_t pa, uint32_t bytes);
+void xbox_PhysNote(uint32_t pa, int identity);
 void xbox_ProtectMirrorsForDebug(void);
 
 /* Dump the guest call stack and abort if the title has not exited within
