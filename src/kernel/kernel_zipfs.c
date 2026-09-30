@@ -12,6 +12,13 @@
  * every other path (saves, caches, anything the title writes) goes to the real
  * directory as before. Lookups ignore case, like FATX and the Xbox DVD.
  *
+ * Several archives can be mounted over the same directory, and their entries
+ * merge into one tree. A game larger than an APK can hold ships as the base
+ * APK plus split APKs, installed together (adb install-multiple): Android's
+ * zipalign and apksigner read no ZIP64 records, so each APK stays under 2 GB
+ * as Python's zipfile writes it, while a 360 disc is 7 GB. Android keeps each
+ * split as its own file (ApplicationInfo.splitSourceDirs), byte for byte.
+ *
  * POSIX only. The Windows oracle reads its game directory directly.
  */
 
@@ -39,15 +46,19 @@ typedef struct {
     int32_t   first_child, last_child, next_sibling;
     int       is_dir;
     uint16_t  dos_time, dos_date;
+    int       zip;           /* which archive (Z.zips) holds the file */
     uint64_t  lho;           /* local header offset */
     uint64_t  data;          /* file data offset; 0 until first resolved */
     uint64_t  size;
 } zipfs_node;
 
+#define ZIPFS_MAX_ZIPS 32
+
 static struct {
     int          files;      /* files mounted; 0 = inactive */
-    char         zip_path[1024];
-    char         root[1024]; /* host directory the archive overlays */
+    char        *zips[ZIPFS_MAX_ZIPS];
+    int          nzips;
+    char         root[1024]; /* host directory the archives overlay */
     size_t       root_len;
     zipfs_node  *nodes;
     int32_t      count, cap;
@@ -98,6 +109,33 @@ static int32_t zfind(const char *rel, size_t n)
     return -1;
 }
 
+/* Room in the hash table for `more` nodes beyond the current ones: at most one
+ * node per two buckets. A later archive can bring more entries than the first
+ * sized it for, so the chains are rebuilt in a larger table. */
+static int zreserve(uint64_t more)
+{
+    uint64_t want = ((uint64_t)Z.count + more) * 2 + 16;
+    uint32_t n = Z.nbuckets ? Z.nbuckets : 1;
+    int32_t *b, i;
+
+    if (Z.buckets && Z.nbuckets >= want) return 1;
+    while (n < want) {
+        if (n >= (1u << 30)) return 0;
+        n <<= 1;
+    }
+    b = (int32_t *)malloc(n * sizeof(int32_t));
+    if (!b) return 0;
+    memset(b, 0xFF, n * sizeof(int32_t));
+    for (i = 0; i < Z.count; i++) {
+        Z.nodes[i].next_hash = b[Z.nodes[i].hash & (n - 1)];
+        b[Z.nodes[i].hash & (n - 1)] = i;
+    }
+    free(Z.buckets);
+    Z.buckets = b;
+    Z.nbuckets = n;
+    return 1;
+}
+
 /* Find or create the node for rel[0..n), creating its parents as directories. */
 static int32_t zadd(const char *rel, size_t n, int is_dir)
 {
@@ -119,6 +157,7 @@ static int32_t zadd(const char *rel, size_t n, int is_dir)
         Z.nodes = nn;
         Z.cap = cap;
     }
+    if (!zreserve(1)) return -1;
     i = Z.count++;
     e = &Z.nodes[i];
     memset(e, 0, sizeof(*e));
@@ -130,6 +169,7 @@ static int32_t zadd(const char *rel, size_t n, int is_dir)
     e->parent = parent;
     e->first_child = e->last_child = e->next_sibling = -1;
     e->is_dir = is_dir;
+    e->zip = -1;                             /* no file data yet */
     e->next_hash = Z.buckets[e->hash & (Z.nbuckets - 1)];
     Z.buckets[e->hash & (Z.nbuckets - 1)] = i;
     if (parent >= 0) {                       /* keep archive order */
@@ -185,7 +225,7 @@ static uint64_t zdata(int32_t i)
     data = e->data;
     if (!data) {
         uint8_t h[30];
-        int fd = open(Z.zip_path, O_RDONLY | O_CLOEXEC);
+        int fd = open(Z.zips[e->zip], O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
             if (read_at(fd, h, sizeof(h), e->lho) && rd32(h) == 0x04034b50u)
                 data = e->lho + 30u + rd16(h + 26) + rd16(h + 28);
@@ -223,13 +263,27 @@ int xbox_zipfs_mount(const char *zip_path, const char *prefix, const char *host_
 {
     uint8_t *tail = NULL, *cd = NULL;
     uint64_t fsz, tail_len, cd_off, cd_size, entries, k, bytes = 0;
-    size_t plen = strlen(prefix), pos;
-    int fd, skipped = 0;
+    size_t plen = strlen(prefix), pos, root_len;
+    int fd = -1, z = Z.nzips, adding = 0, added = 0, replaced = 0, skipped = 0;
     int64_t eocd = -1;
     int64_t i;
+    char root[1024];
 
-    if (Z.files)                                    /* once per process */
-        return strcmp(zip_path, Z.zip_path) == 0 ? Z.files : -1;
+    snprintf(root, sizeof(root), "%s", host_root);
+    root_len = strlen(root);
+    while (root_len > 1 && root[root_len - 1] == '/')
+        root[--root_len] = '\0';
+    for (i = 0; i < Z.nzips; i++)                   /* mounted already */
+        if (strcmp(Z.zips[i], zip_path) == 0) return Z.files;
+    if (Z.nzips && strcmp(root, Z.root) != 0) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "zipfs: %s would overlay %s, but the game is at %s",
+                 zip_path, root, Z.root);
+        return -1;
+    }
+    if (Z.nzips == ZIPFS_MAX_ZIPS) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "zipfs: %s: already %d archives", zip_path, Z.nzips);
+        return -1;
+    }
 
     fd = open(zip_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -262,18 +316,18 @@ int xbox_zipfs_mount(const char *zip_path, const char *prefix, const char *host_
     cd = (uint8_t *)malloc((size_t)cd_size);
     if (!cd || !read_at(fd, cd, (size_t)cd_size, cd_off)) goto fail;
 
-    Z.nbuckets = 1;
-    while (Z.nbuckets < entries * 2 + 16) Z.nbuckets <<= 1;
-    Z.buckets = (int32_t *)malloc(Z.nbuckets * sizeof(int32_t));
-    if (!Z.buckets) goto fail;
-    memset(Z.buckets, 0xFF, Z.nbuckets * sizeof(int32_t));
-    if (zadd("", 0, 1) != 0) goto fail;             /* node 0 = the root */
+    /* Nothing below fails on a well-formed archive, only on memory. */
+    Z.zips[z] = strdup(zip_path);
+    if (!Z.zips[z] || !zreserve(entries + 1)) goto fail;
+    if (Z.count == 0 && zadd("", 0, 1) != 0) goto fail;   /* node 0 = the root */
+    adding = 1;
 
     for (pos = 0, k = 0; k < entries; k++) {
         const uint8_t *c = cd + pos;
         uint16_t flags, method, nlen, xlen, clen;
         uint64_t csize, usize, lho;
         const char *name;
+        zipfs_node *e;
         int32_t n;
 
         if (pos + 46 > cd_size || rd32(c) != 0x02014b50u) break;
@@ -314,25 +368,37 @@ int xbox_zipfs_mount(const char *zip_path, const char *prefix, const char *host_
         }
         n = zadd(name + plen, nlen - plen, 0);
         if (n < 0) goto fail;
-        Z.nodes[n].lho = lho;
-        Z.nodes[n].size = usize;
-        Z.nodes[n].dos_time = rd16(c + 12);
-        Z.nodes[n].dos_date = rd16(c + 14);
-        Z.files++;
+        e = &Z.nodes[n];
+        if (e->is_dir) {                            /* a directory in an earlier archive */
+            if (skipped++ < 8)
+                xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE,
+                         "zipfs: %.*s is a directory in an earlier archive, skipped", (int)nlen, name);
+            continue;
+        }
+        if (e->zip >= 0) replaced++;                /* the later archive's copy wins */
+        else Z.files++;
+        e->zip = z;
+        e->lho = lho;
+        e->data = 0;
+        e->size = usize;
+        e->dos_time = rd16(c + 12);
+        e->dos_date = rd16(c + 14);
+        added++;
         bytes += usize;
     }
     free(cd);
     free(tail);
     close(fd);
 
-    snprintf(Z.zip_path, sizeof(Z.zip_path), "%s", zip_path);
-    snprintf(Z.root, sizeof(Z.root), "%s", host_root);
-    Z.root_len = strlen(Z.root);
-    while (Z.root_len > 1 && Z.root[Z.root_len - 1] == '/')
-        Z.root[--Z.root_len] = '\0';
-    fprintf(stderr, "  [ZIPFS] %d game files (%llu MB) from %s over %s%s\n", Z.files,
-            (unsigned long long)(bytes >> 20), zip_path, Z.root,
-            skipped ? " (some entries skipped: not stored)" : "");
+    Z.nzips++;
+    if (z == 0) {
+        memcpy(Z.root, root, root_len + 1);
+        Z.root_len = root_len;
+    }
+    fprintf(stderr, "  [ZIPFS] %d game files (%llu MB) from %s over %s; %d from %d archive%s%s%s\n",
+            added, (unsigned long long)(bytes >> 20), zip_path, Z.root, Z.files, Z.nzips,
+            Z.nzips == 1 ? "" : "s", replaced ? " (some replace an earlier archive's)" : "",
+            skipped ? " (some entries skipped)" : "");
     fflush(stderr);
     return Z.files;
 
@@ -341,9 +407,21 @@ fail:
     free(cd);
     free(tail);
     close(fd);
+    if (adding && Z.nzips > 0) {
+        /* Out of memory half-way through a later archive: its nodes so far
+         * point at it, so it stays registered; the earlier ones are intact. */
+        Z.nzips++;
+        return -1;
+    }
+    if (Z.nzips > 0) {                              /* nothing of this one was added */
+        free(Z.zips[z]);
+        Z.zips[z] = NULL;
+        return -1;
+    }
     for (i = 0; i < Z.count; i++) free(Z.nodes[i].name);
     free(Z.nodes);
     free(Z.buckets);
+    free(Z.zips[0]);
     memset(&Z, 0, sizeof(Z));
     return -1;
 }
@@ -376,7 +454,7 @@ int xbox_zipfs_open(const char *host_path, int64_t *base, int64_t *size)
     int fd;
 
     if (i < 0) return -1;
-    fd = open(Z.zip_path, O_RDONLY | O_CLOEXEC);
+    fd = open(Z.zips[Z.nodes[i].is_dir ? 0 : Z.nodes[i].zip], O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     if (Z.nodes[i].is_dir) {                        /* a placeholder fd; never read */
         *base = 0;

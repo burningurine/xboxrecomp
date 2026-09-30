@@ -546,9 +546,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 
 #if !defined(_WIN32)
 /*
- * Game files inside a zip archive (kernel_zipfs.c): on Android, the disc files
- * packed STORED into the APK under assets/game/. Mounted once, before the
- * guest boots; the archive then overlays host_root read-only.
+ * Game files inside zip archives (kernel_zipfs.c): on Android, the disc files
+ * packed STORED into the APK under assets/game/. Mounted before the guest
+ * boots, one archive per call (the base APK, then any split APKs, all over the
+ * same host_root); their entries merge into one read-only overlay. Returns the
+ * number of files mounted so far, or -1.
  */
 struct stat;
 int     xbox_zipfs_mount(const char *zip_path, const char *prefix, const char *host_root);
