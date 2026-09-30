@@ -13,6 +13,19 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
+> **About this fork.** The `blinx-port` branch carries the runtime and recompiler changes behind an
+> unofficial Android port of *Blinx: The Time Sweeper*
+> ([blinx-android](https://github.com/michaeltabet5-blip/blinx-android)).
+> - **Android runtime:** a POSIX/ARM64 backend, an MMIO trap, pausing the game when the app is in
+>   the background, and reading game files from inside an APK.
+> - **Lifter correctness fixes** for the recompiler.
+>
+> Upstream: [fearkov/xboxrecomp](https://github.com/fearkov/xboxrecomp), MIT; the same license
+> applies to these changes. The fork is not affiliated with Microsoft, Xbox, Artoon or any rights
+> holder, and all trademarks belong to their owners. It contains no game code, assets, BIOS or
+> keys: you need your own legally obtained copy of any game you recompile. Provided "as is",
+> without warranty of any kind; nothing here is legal advice.
+
 **[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
 community hub for sp00nznet's recomp projects, where ps3recomp development
 happens in the open. Good place to ask questions, show a port you are working
