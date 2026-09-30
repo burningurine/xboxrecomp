@@ -1090,6 +1090,11 @@ class Lifter:
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.manual_functions = set(manual_functions or ())
+        # addr -> public name for functions recomp_manual.c WRAPS (defines
+        # sub_X itself and calls the generated body as sub_X_gen). The body is
+        # emitted under the _gen name, but every call site must name the
+        # wrapper, or direct callers silently bypass it.
+        self.wrapped_functions = {}
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1143,7 +1148,9 @@ class Lifter:
         function any naming pass had touched. Labels still cover call targets
         that are not known function starts.
         """
-        if addr in self.func_db:
+        if addr in self.wrapped_functions:
+            name = self.wrapped_functions[addr]
+        elif addr in self.func_db:
             name = self.func_db[addr].get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
